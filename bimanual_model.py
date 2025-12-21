@@ -84,11 +84,10 @@ class BimanualAGI(nn.Module):
         # This matches the original IP design + bimanual cross edges
         
         # Local edges: Spatial relations within same timestep
+        # NOTE: Cross edges removed from local stage - they appear in cond/action after gating
         local_edges = [
             ('gripper_left', 'rel', 'gripper_left'),
-            ('gripper_right', 'rel', 'gripper_right'),
-            ('gripper_left', 'cross', 'gripper_right'), # Cross-arm current
-            ('gripper_right', 'cross', 'gripper_left'),
+           ('gripper_right', 'rel', 'gripper_right'),
         ]
         
         # Context edges: Demo temporal and demo-to-current
@@ -104,6 +103,8 @@ class BimanualAGI(nn.Module):
         ]
         if self.graph.use_cross_arm:
             cond_edges.extend([
+                ('gripper_left', 'cross', 'gripper_right'),  # Current cross-arm
+                ('gripper_right', 'cross', 'gripper_left'),  # after local processing
                 ('gripper_left', 'cross_demo', 'gripper_right'),
                 ('gripper_right', 'cross_demo', 'gripper_left'),
             ])

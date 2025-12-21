@@ -292,11 +292,20 @@ class BimanualGraphRep(nn.Module):
         # Embedding indices for gripper nodes
         # Demo nodes: Encode demo_idx, timestep, and node to give temporal identity
         # This ensures demo gripper at t=0 has different embedding than t=5
+        # Range: [0, D*T*G-1]
         grip_embd_demo = grip_demo_demo * T * G + grip_time_demo * G + grip_node_demo
-        # Current nodes: use G + node index
-        grip_embd_curr = grip_node_curr
-        # Action nodes: use node index + G * action_step
-        grip_embd_act = grip_node_act + G * (grip_time_act - T - 1)
+        
+        # CRITICAL: Current and action must NOT overlap with demo indices!
+        # Demo uses [0, D*T*G-1], so current/action must start at D*T*G
+        num_demo_embeds = D * T * G
+        
+        # Current nodes: start after demo embeddings
+        # Range: [D*T*G, D*T*G + G-1]
+        grip_embd_curr = grip_node_curr + num_demo_embeds
+        
+        # Action nodes: start after current embeddings
+        # Range: [D*T*G + G, D*T*G + G + P*G-1]
+        grip_embd_act = grip_node_act + G * (grip_time_act - T - 1) + num_demo_embeds + G
         
         gripper_info = {
             'batch': torch.cat([grip_batch_demo, grip_batch_curr, grip_batch_act]),
@@ -471,18 +480,16 @@ class BimanualGraphRep(nn.Module):
         self.graph[('gripper_right', 'cross_action', 'gripper_left')].edge_index = dense_rl[:, cross_rl_act]
         
         # ==================== Demo Cross-Arm ====================
-        # Allow cross-arm visibility across different timesteps to learn coordination timing
-        # This enables patterns like "left arm at t=3 sees right arm's trajectory from t=0 to t=5"
-        
-        max_time_offset = self.config.get('cross_arm_time_window', 3)  # ±3 timesteps
+        # Full temporal visibility for learning long-range coordination patterns
+        # CHANGED: Removed time window restriction to enable learning like
+        # "right arm position at t=0 determines where left should be at t=9"
         
         cross_lr_demo = (
             (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
             (g_left['time'][dense_lr[0]] < T) &
             (g_right['time'][dense_lr[1]] < T) &
-            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]]) &  # Same demo
-            # Allow time offsets within window
-            (torch.abs(g_left['time'][dense_lr[0]].long() - g_right['time'][dense_lr[1]].long()) <= max_time_offset)
+            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]])  # Same demo
+            # No time restriction - full trajectory visibility
         )
         self.graph[('gripper_left', 'cross_demo', 'gripper_right')].edge_index = dense_lr[:, cross_lr_demo]
         
@@ -490,8 +497,7 @@ class BimanualGraphRep(nn.Module):
             (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
             (g_right['time'][dense_rl[0]] < T) &
             (g_left['time'][dense_rl[1]] < T) &
-            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]]) &
-            (torch.abs(g_right['time'][dense_rl[0]].long() - g_left['time'][dense_rl[1]].long()) <= max_time_offset)
+            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]])
         )
         self.graph[('gripper_right', 'cross_demo', 'gripper_left')].edge_index = dense_rl[:, cross_rl_demo]
     

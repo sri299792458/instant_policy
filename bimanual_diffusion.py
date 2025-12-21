@@ -177,6 +177,11 @@ class BimanualGraphDiffusion(L.LightningModule):
         labels_left[..., :6] = self.normalizer_left.normalize_labels(labels_left[..., :6])
         labels_right[..., :6] = self.normalizer_right.normalize_labels(labels_right[..., :6])
         
+        # CRITICAL: Save ground truth before overwriting!
+        # Coordination loss needs GT, not noisy actions
+        gt_actions_left = data.actions_left.clone()
+        gt_actions_right = data.actions_right.clone()
+        
         # Store noisy actions in data
         data.actions_left = noisy_actions_left
         data.actions_right = noisy_actions_right
@@ -194,9 +199,10 @@ class BimanualGraphDiffusion(L.LightningModule):
         
         # Optional coordination consistency loss
         if self.config.get('use_coordination_loss', False):
+            # Use GT actions, not the overwritten noisy ones!
             coord_loss = self._compute_coordination_loss(
                 noisy_actions_left, noisy_actions_right,
-                data.actions_left, data.actions_right
+                gt_actions_left, gt_actions_right
             )
             coord_weight = self.config.get('coordination_loss_weight', 0.1)
             loss = loss + coord_weight * coord_loss
