@@ -362,8 +362,16 @@ class BimanualPseudoDemoGenerator:
     def _add_timing_jitter(self, T_left: np.ndarray, T_right: np.ndarray,
                            grips_left: np.ndarray, grips_right: np.ndarray
                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Add phase offset between arms."""
-        shift = np.random.randint(-3, 4)  # -3 to +3 frames
+        """Add phase offset and time-stretching between arms."""
+        # Optionally time-stretch one arm (50% chance)
+        if np.random.random() < 0.5:
+            stretch = np.random.uniform(0.85, 1.15)
+            T_right, grips_right = self._time_stretch_trajectory(
+                T_right, grips_right, stretch
+            )
+        
+        # Phase offset: ±10 frames instead of ±3
+        shift = np.random.randint(-10, 11)  # -10 to +10 frames
         
         if shift == 0:
             return T_left, T_right, grips_left, grips_right
@@ -376,9 +384,9 @@ class BimanualPseudoDemoGenerator:
             grips_right_new = np.zeros_like(grips_right)
             
             T_right_new[:shift] = T_right[0]
-            T_right_new[shift:] = T_right[:-shift]
+            T_right_new[shift:] = T_right[:T-shift]
             grips_right_new[:shift] = grips_right[0]
-            grips_right_new[shift:] = grips_right[:-shift]
+            grips_right_new[shift:] = grips_right[:T-shift]
             
             return T_left, T_right_new, grips_left, grips_right_new
         else:
@@ -388,11 +396,40 @@ class BimanualPseudoDemoGenerator:
             grips_left_new = np.zeros_like(grips_left)
             
             T_left_new[:shift] = T_left[0]
-            T_left_new[shift:] = T_left[:-shift]
+            T_left_new[shift:] = T_left[:T-shift]
             grips_left_new[:shift] = grips_left[0]
-            grips_left_new[shift:] = grips_left[:-shift]
+            grips_left_new[shift:] = grips_left[:T-shift]
             
             return T_left_new, T_right, grips_left_new, grips_right
+    
+    def _time_stretch_trajectory(self, T: np.ndarray, grips: np.ndarray, 
+                                  stretch: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Time-stretch a trajectory by resampling."""
+        T_len = len(T)
+        new_len = int(T_len * stretch)
+        
+        if new_len >= T_len:
+            return T, grips
+        
+        # Resample to match original length
+        indices = np.linspace(0, T_len - 1, new_len).astype(int)
+        T_stretched = T[indices]
+        grips_stretched = grips[indices]
+        
+        # Pad or truncate to original length
+        if new_len < T_len:
+            # Pad by repeating last state
+            T_padded = np.zeros_like(T)
+            T_padded[:new_len] = T_stretched
+            T_padded[new_len:] = T_stretched[-1]
+            
+            grips_padded = np.zeros_like(grips)
+            grips_padded[:new_len] = grips_stretched
+            grips_padded[new_len:] = grips_stretched[-1]
+            
+            return T_padded, grips_padded
+        
+        return T_stretched[:T_len], grips_stretched[:T_len]
     
     def _flip_grippers(self, grips_left: np.ndarray, grips_right: np.ndarray
                        ) -> Tuple[np.ndarray, np.ndarray]:

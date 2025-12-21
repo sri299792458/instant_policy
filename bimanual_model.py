@@ -168,6 +168,17 @@ class BimanualAGI(nn.Module):
             self.cond_encoder = torch.compile(self.cond_encoder, mode="reduce-overhead")
             self.action_encoder = torch.compile(self.action_encoder, mode="reduce-overhead")
         
+        # ============== Selective Coordination Gating ==============
+        # Learn when to coordinate: high gate = coordinated, low gate = independent
+        self.use_coordination_gate = config.get('use_coordination_gate', True)
+        if self.use_coordination_gate and self.graph.use_cross_arm:
+            self.coordination_gate = nn.Sequential(
+                nn.Linear(config['hidden_dim'] * 2, 256),
+                nn.GELU(),
+                nn.Linear(256, 1),
+                nn.Sigmoid()
+            ).to(config['device'])
+        
         # ============== Prediction Heads (per arm) ==============
         # Left arm
         self.pred_head_trans_left = MLP(
@@ -344,6 +355,26 @@ class BimanualAGI(nn.Module):
             self.graph.graph.edge_index_dict,
             self.graph.graph.edge_attr_dict
         )
+        
+        # ============== Apply Coordination Gating ==============
+        # Compute how much the arms should attend to each other
+        if self.use_coordination_gate and self.graph.use_cross_arm:
+            # Pool current gripper features for both arms
+            curr_time = self.traj_horizon
+            left_curr_mask = self.graph.graph.gripper_left_time == curr_time
+            right_curr_mask = self.graph.graph.gripper_right_time == curr_time
+            
+            left_pooled = x_dict['gripper_left'][left_curr_mask].mean(dim=0)  # [hidden_dim]
+            right_pooled = x_dict['gripper_right'][right_curr_mask].mean(dim=0)
+            
+            combined = torch.cat([left_pooled, right_pooled], dim=-1)  # [2*hidden_dim]
+            coord_gate = self.coordination_gate(combined)  # [1]
+            
+            # Scale cross-arm edge attributes by gate
+            for edge_type in self.graph.graph.edge_attr_dict.keys():
+                if 'cross' in edge_type[1]:  # cross, cross_demo, cross_action edges
+                    self.graph.graph.edge_attr_dict[edge_type] = \
+                        self.graph.graph.edge_attr_dict[edge_type] * coord_gate
         
         # 2. Context Propagation
         # Propagates information from demos to current context

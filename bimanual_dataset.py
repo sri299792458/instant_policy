@@ -201,7 +201,7 @@ class BimanualRunningDataset(Dataset):
     loading from disk.
     """
     
-    def __init__(self, config: Dict, buffer_size: int = 1000):
+    def __init__(self, config: Dict, buffer_size: int = 10000):
         """
         Initialize running dataset.
         
@@ -400,9 +400,19 @@ def collate_bimanual(batch: List[BimanualGraphData]) -> BimanualGraphData:
     
     # Flatten demo point clouds and add batch indices
     for arm in ['left', 'right']:
-        pos_demos = getattr(result, f'pos_demos_{arm}')  # [B, T, N, 3]
-        if len(pos_demos.shape) == 4:
-            B, T, N, _ = pos_demos.shape
+        pos_demos = getattr(result, f'pos_demos_{arm}')  # Could be [B, T, N, 3] or [B, D, T, N, 3]
+        
+        if len(pos_demos.shape) == 5:
+            # Full shape with demo dimension [B, D, T, N, 3]
+            B, D, T, N, _ = pos_demos.shape
+            pos_demos_flat = pos_demos.reshape(B * D * T * N, 3)
+            batch_demos = torch.arange(B * D * T, device=pos_demos.device
+                )[:, None].repeat(1, N).view(-1)
+            setattr(result, f'pos_demos_{arm}', pos_demos_flat)
+            setattr(result, f'batch_demos_{arm}', batch_demos)
+        elif len(pos_demos.shape) == 4:
+            # No demo dimension [B, T, N, 3] - treat as single demo per batch
+            B, T, N,  _ = pos_demos.shape
             pos_demos_flat = pos_demos.reshape(B * T * N, 3)
             batch_demos = torch.arange(B * T, device=pos_demos.device
                 )[:, None].repeat(1, N).view(-1)

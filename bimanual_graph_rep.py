@@ -125,6 +125,7 @@ class BimanualGraphRep(nn.Module):
         self.pred_horizon = config['pre_horizon']
         self.pos_in_nodes = config['pos_in_nodes']
         self.use_cross_arm = config.get('use_cross_arm_attention', True)
+        self.config = config  # Store full config for accessing optional parameters
         
         # Gripper keypoints (6 points defining gripper geometry)
         self.gripper_keypoints = config['gripper_keypoints'].to(self.device)
@@ -147,8 +148,12 @@ class BimanualGraphRep(nn.Module):
         
         # Learnable embeddings for gripper nodes
         # We have: demo gripper nodes + current gripper + action gripper nodes
-        # For each arm: traj_horizon * num_g_nodes (demo) + num_g_nodes (current) + pred_horizon * num_g_nodes (action)
-        num_gripper_embeddings = self.num_g_nodes * (self.pred_horizon + 1)  # Current + action nodes
+        # Demo nodes now encode: demo_idx * T * G + time * G + node_idx
+        # Max demo index: num_demos * traj_horizon * num_g_nodes
+        # Current and action: num_g_nodes * (pred_horizon + 1)
+        num_demo_embeddings = self.num_demos * self.traj_horizon * self.num_g_nodes
+        num_other_embeddings = self.num_g_nodes * (self.pred_horizon + 1)
+        num_gripper_embeddings = num_demo_embeddings + num_other_embeddings
         self.gripper_embds_left = nn.Embedding(num_gripper_embeddings, 
                                                 self.embd_dim - self.g_state_dim)
         self.gripper_embds_right = nn.Embedding(num_gripper_embeddings,
@@ -285,8 +290,9 @@ class BimanualGraphRep(nn.Module):
         grip_demo_act = torch.full((B * P * G,), D, device=self.device)
         
         # Embedding indices for gripper nodes
-        # Demo nodes: just use node index (0 to G-1)
-        grip_embd_demo = grip_node_demo
+        # Demo nodes: Encode demo_idx, timestep, and node to give temporal identity
+        # This ensures demo gripper at t=0 has different embedding than t=5
+        grip_embd_demo = grip_demo_demo * T * G + grip_time_demo * G + grip_node_demo
         # Current nodes: use G + node index
         grip_embd_curr = grip_node_curr
         # Action nodes: use node index + G * action_step
@@ -465,13 +471,18 @@ class BimanualGraphRep(nn.Module):
         self.graph[('gripper_right', 'cross_action', 'gripper_left')].edge_index = dense_rl[:, cross_rl_act]
         
         # ==================== Demo Cross-Arm ====================
-        # Same timestep in demo
+        # Allow cross-arm visibility across different timesteps to learn coordination timing
+        # This enables patterns like "left arm at t=3 sees right arm's trajectory from t=0 to t=5"
+        
+        max_time_offset = self.config.get('cross_arm_time_window', 3)  # ±3 timesteps
+        
         cross_lr_demo = (
             (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
             (g_left['time'][dense_lr[0]] < T) &
             (g_right['time'][dense_lr[1]] < T) &
-            (g_left['time'][dense_lr[0]] == g_right['time'][dense_lr[1]]) &
-            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]])  # Same demo
+            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]]) &  # Same demo
+            # Allow time offsets within window
+            (torch.abs(g_left['time'][dense_lr[0]].long() - g_right['time'][dense_lr[1]].long()) <= max_time_offset)
         )
         self.graph[('gripper_left', 'cross_demo', 'gripper_right')].edge_index = dense_lr[:, cross_lr_demo]
         
@@ -479,8 +490,8 @@ class BimanualGraphRep(nn.Module):
             (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
             (g_right['time'][dense_rl[0]] < T) &
             (g_left['time'][dense_rl[1]] < T) &
-            (g_right['time'][dense_rl[0]] == g_left['time'][dense_rl[1]]) &
-            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]])
+            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]]) &
+            (torch.abs(g_right['time'][dense_rl[0]].long() - g_left['time'][dense_rl[1]].long()) <= max_time_offset)
         )
         self.graph[('gripper_right', 'cross_demo', 'gripper_left')].edge_index = dense_rl[:, cross_rl_demo]
     
