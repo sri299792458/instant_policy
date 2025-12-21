@@ -245,9 +245,11 @@ class BimanualAGI(nn.Module):
         
         embds, pos, batch = encoder(None, pos_demos, batch_demos)
         
+        # Get actual batch size from data (like original IP)
+        bs = data.actions_left.shape[0]
+        
         # Reshape to [B, D, T, S, dim]
         embds = to_dense_batch(embds, batch, fill_value=0)[0]
-        bs = embds.shape[0] # Dynamic batch size
         embds = embds.view(
             bs, self.num_demos, self.traj_horizon,
             -1, self.local_embd_dim
@@ -255,7 +257,7 @@ class BimanualAGI(nn.Module):
         
         pos = to_dense_batch(pos, batch, fill_value=0)[0]
         pos = pos.view(
-            self.batch_size, self.num_demos, self.traj_horizon, -1, 3
+            bs, self.num_demos, self.traj_horizon, -1, 3
         )
         
         return embds, pos
