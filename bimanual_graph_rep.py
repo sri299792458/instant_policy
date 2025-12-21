@@ -582,22 +582,20 @@ class BimanualGraphRep(nn.Module):
             # Compute gripper node positions
             base_kp = self.gripper_keypoints[None, None, None, :, :]  # [1, 1, 1, G, 3]
             
-            # Demo gripper positions (in world frame, but we transform to local)
+            # Demo gripper positions in local frame
             demo_kp = base_kp.expand(B, D, T, G, 3)
-            demo_kp_world = self.transform_gripper_nodes(demo_kp, demo_T)
             
             # Current gripper positions (at origin in local frame)
             curr_kp = self.gripper_keypoints[None, :, :].expand(B, G, 3)
             
-            # Action gripper positions
+            # Action gripper positions in action frame
             action_kp = base_kp[:, 0].expand(B, P, G, 3)
-            action_kp_transformed = self.transform_gripper_nodes(action_kp, actions_T)
             
             # Concatenate positions
             grip_pos = torch.cat([
-                demo_kp_world.reshape(-1, 3),  # For now, keep in world - will compute relative in edges
+                demo_kp.reshape(-1, 3),
                 curr_kp.reshape(-1, 3),
-                action_kp_transformed.reshape(-1, 3),
+                action_kp.reshape(-1, 3),
             ], dim=0)
             
             # Compute gripper state embeddings
@@ -707,7 +705,7 @@ class BimanualGraphRep(nn.Module):
                 self._add_rel_edge_attr(scene_key, grip_key, edge_type, all_T_w_e, all_T_e_w)
             
             # Gripper-gripper local edges
-            self._add_rel_edge_attr(grip_key, grip_key, 'rel', all_T_w_e, all_T_e_w)
+            self._add_rel_edge_attr(grip_key, grip_key, 'rel')
             
             # Context edges (with learnable embedding)
             edge_key = (grip_key, 'cond', grip_key)
@@ -826,13 +824,14 @@ class BimanualGraphRep(nn.Module):
                  # This rotates the source position vector by the relative rotation.
                  
                  pos_dest_rot = torch.bmm(T_src_dst[..., :3, :3], src_pos[..., None]).squeeze(-1)
+                 rel_trans = T_src_dst[..., :3, 3]
                  
                  # Features:
-                 # 1. pos_dest - pos_source
-                 # 2. pos_dest_rot - pos_source
+                 # 1. Relative translation (source frame)
+                 # 2. Rotation effect on source keypoints
                  
                  return torch.cat([
-                    self.pos_encoder(dst_pos - src_pos),
+                    self.pos_encoder(rel_trans),
                     self.pos_encoder(pos_dest_rot - src_pos)
                  ], dim=-1)
 
@@ -845,68 +844,124 @@ class BimanualGraphRep(nn.Module):
     
     def _compute_cross_arm_edge_attrs(self, data):
         """Compute edge attributes for cross-arm edges."""
-        # Cross-arm edges encode the relative transform between arms
+        T = self.traj_horizon
         T_left_to_right = data.current_T_left_to_right  # [B, 4, 4]
+        if T_left_to_right is None:
+            return
+        if T_left_to_right.dim() == 2:
+            T_left_to_right = T_left_to_right.unsqueeze(0)
         
-        for edge_key in [
-            ('gripper_left', 'cross', 'gripper_right'),
-            ('gripper_left', 'cross_action', 'gripper_right'),
-            ('gripper_left', 'cross_demo', 'gripper_right'),
-        ]:
+        # Demo transforms (per-timestep, per-demo)
+        demo_T_left_to_right = getattr(data, 'demo_T_left_to_right', None)
+        if demo_T_left_to_right is None:
+            demo_T_left = getattr(data, 'demo_T_w_left', None)
+            demo_T_right = getattr(data, 'demo_T_w_right', None)
+            if demo_T_left is not None and demo_T_right is not None:
+                demo_T_left_to_right = torch.matmul(torch.inverse(demo_T_left), demo_T_right)
+        if demo_T_left_to_right is not None:
+            if demo_T_left_to_right.dim() == 3:
+                demo_T_left_to_right = demo_T_left_to_right.unsqueeze(0).unsqueeze(1)
+            elif demo_T_left_to_right.dim() == 4:
+                demo_T_left_to_right = demo_T_left_to_right.unsqueeze(1)
+        
+        # Action transforms (per-action-step)
+        actions_left = getattr(data, 'actions_left', None)
+        actions_right = getattr(data, 'actions_right', None)
+        if actions_left is not None and actions_left.dim() == 3:
+            actions_left = actions_left.unsqueeze(0)
+        if actions_right is not None and actions_right.dim() == 3:
+            actions_right = actions_right.unsqueeze(0)
+        action_T_left_to_right = None
+        if actions_left is not None and actions_right is not None:
+            B, P = actions_left.shape[:2]
+            T_lr_curr = T_left_to_right[:, None, :, :].expand(B, P, 4, 4).reshape(-1, 4, 4)
+            A_left_inv = torch.inverse(actions_left.reshape(-1, 4, 4))
+            A_right = actions_right.reshape(-1, 4, 4)
+            action_T_left_to_right = torch.bmm(
+                A_left_inv, torch.bmm(T_lr_curr, A_right)
+            ).view(B, P, 4, 4)
+        
+        def _build_cross_attr(edge_index, src_key, dst_key, T_src_from_dst):
+            if edge_index.shape[1] == 0:
+                return torch.zeros((0, self.edge_dim), device=self.device)
+            src_pos = self.graph[src_key].pos[edge_index[0]]
+            dst_pos = self.graph[dst_key].pos[edge_index[1]]
+            
+            dst_in_src = torch.bmm(
+                T_src_from_dst[:, :3, :3],
+                dst_pos[:, :, None]
+            ).squeeze(-1) + T_src_from_dst[:, :3, 3]
+            rel_pos = dst_in_src - src_pos
+            pos_dest_rot = torch.bmm(
+                T_src_from_dst[:, :3, :3],
+                src_pos[:, :, None]
+            ).squeeze(-1)
+            
+            return torch.cat([
+                self.pos_encoder(rel_pos),
+                self.pos_encoder(pos_dest_rot - src_pos),
+            ], dim=-1)
+        
+        def _edge_attrs_for_direction(src_arm, dst_arm, edge_type,
+                                      T_curr, T_action, T_demo):
+            edge_key = (f'gripper_{src_arm}', edge_type, f'gripper_{dst_arm}')
             if edge_key not in self.graph.edge_types:
-                continue
+                return
             
             edge_index = self.graph[edge_key].edge_index
             num_edges = edge_index.shape[1]
+            if num_edges == 0:
+                self.graph[edge_key].edge_attr = torch.zeros((0, self.edge_dim), device=self.device)
+                return
             
-            # Get positions and compute relative
-            src_pos = self.graph['gripper_left'].pos[edge_index[0]]
-            dst_pos = self.graph['gripper_right'].pos[edge_index[1]]
+            src_key = f'gripper_{src_arm}'
+            src_batch = getattr(self.graph, f'{src_key}_batch')[edge_index[0]]
+            src_time = getattr(self.graph, f'{src_key}_time')[edge_index[0]].long()
             
-            # Transform src_pos to right frame using T_left_to_right
-            # For now, simplified: just use relative positions
-            rel_pos = dst_pos - src_pos
+            if edge_type == 'cross':
+                T_src_from_dst = T_curr[src_batch]
+            elif edge_type == 'cross_action':
+                if T_action is None:
+                    T_src_from_dst = T_curr[src_batch]
+                else:
+                    max_step = T_action.shape[1] - 1
+                    action_step = (src_time - T - 1).clamp(min=0, max=max_step)
+                    T_src_from_dst = T_action[src_batch, action_step]
+            else:  # cross_demo
+                if T_demo is None:
+                    T_src_from_dst = T_curr[src_batch]
+                else:
+                    src_demo = getattr(self.graph, f'{src_key}_demo')[edge_index[0]].long()
+                    T_src_from_dst = T_demo[src_batch, src_demo, src_time]
             
-            base_attr = torch.cat([
-                self.pos_encoder(rel_pos),
-                self.pos_encoder(rel_pos),
-            ], dim=-1)
+            base_attr = _build_cross_attr(edge_index, src_key, f'gripper_{dst_arm}', T_src_from_dst)
             
-            # Add learnable embedding for cross-arm
-            if 'action' in edge_key[1]:
+            if 'action' in edge_type:
                 learned = self.cross_action_edge_embd(torch.zeros(num_edges, device=self.device).long())
             else:
                 learned = self.cross_arm_edge_embd(torch.zeros(num_edges, device=self.device).long())
             
             self.graph[edge_key].edge_attr = base_attr + learned
         
-        # Reverse direction edges
-        for edge_key in [
-            ('gripper_right', 'cross', 'gripper_left'),
-            ('gripper_right', 'cross_action', 'gripper_left'),
-            ('gripper_right', 'cross_demo', 'gripper_left'),
-        ]:
-            if edge_key not in self.graph.edge_types:
-                continue
-            
-            edge_index = self.graph[edge_key].edge_index
-            num_edges = edge_index.shape[1]
-            
-            src_pos = self.graph['gripper_right'].pos[edge_index[0]]
-            dst_pos = self.graph['gripper_left'].pos[edge_index[1]]
-            rel_pos = dst_pos - src_pos
-            
-            base_attr = torch.cat([
-                self.pos_encoder(rel_pos),
-                self.pos_encoder(rel_pos),
-            ], dim=-1)
-            
-            if 'action' in edge_key[1]:
-                learned = self.cross_action_edge_embd(torch.zeros(num_edges, device=self.device).long())
-            else:
-                learned = self.cross_arm_edge_embd(torch.zeros(num_edges, device=self.device).long())
-            
-            self.graph[edge_key].edge_attr = base_attr + learned
+        T_right_to_left = torch.inverse(T_left_to_right)
+        action_T_right_to_left = torch.inverse(action_T_left_to_right) if action_T_left_to_right is not None else None
+        demo_T_right_to_left = torch.inverse(demo_T_left_to_right) if demo_T_left_to_right is not None else None
+        
+        # Left -> Right edges
+        _edge_attrs_for_direction('left', 'right', 'cross',
+                                  T_left_to_right, action_T_left_to_right, demo_T_left_to_right)
+        _edge_attrs_for_direction('left', 'right', 'cross_action',
+                                  T_left_to_right, action_T_left_to_right, demo_T_left_to_right)
+        _edge_attrs_for_direction('left', 'right', 'cross_demo',
+                                  T_left_to_right, action_T_left_to_right, demo_T_left_to_right)
+        
+        # Right -> Left edges
+        _edge_attrs_for_direction('right', 'left', 'cross',
+                                  T_right_to_left, action_T_right_to_left, demo_T_right_to_left)
+        _edge_attrs_for_direction('right', 'left', 'cross_action',
+                                  T_right_to_left, action_T_right_to_left, demo_T_right_to_left)
+        _edge_attrs_for_direction('right', 'left', 'cross_demo',
+                                  T_right_to_left, action_T_right_to_left, demo_T_right_to_left)
     
     def reinit_graphs(self, batch_size: int, num_demos: Optional[int] = None):
         """Reinitialize graph structure for new batch size or number of demos."""

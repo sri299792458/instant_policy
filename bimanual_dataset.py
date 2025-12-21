@@ -91,6 +91,13 @@ class BimanualDataset(Dataset):
         demo_T_right = demo.T_w_right[:self.traj_horizon]
         demo_grips_left = demo.grips_left[:self.traj_horizon]  # [T]
         demo_grips_right = demo.grips_right[:self.traj_horizon]
+        if hasattr(demo, 'T_left_to_right'):
+            demo_T_left_to_right = demo.T_left_to_right[:self.traj_horizon]
+        else:
+            demo_T_left_to_right = np.array([
+                np.linalg.inv(demo_T_left[i]) @ demo_T_right[i]
+                for i in range(self.traj_horizon)
+            ])
         
         # Get current observation (use last demo frame as observation)
         obs_T_left = demo.T_w_left[obs_idx]  # [4, 4]
@@ -149,6 +156,9 @@ class BimanualDataset(Dataset):
         graph_data.demo_T_w_right = torch.tensor(demo_T_right, dtype=torch.float32).unsqueeze(0)
         graph_data.demo_grips_left = torch.tensor(demo_grips_left, dtype=torch.float32).unsqueeze(0)
         graph_data.demo_grips_right = torch.tensor(demo_grips_right, dtype=torch.float32).unsqueeze(0)
+        graph_data.demo_T_left_to_right = torch.tensor(
+            demo_T_left_to_right, dtype=torch.float32
+        ).unsqueeze(0)
         
         # Demo point clouds
         demo_pcds_left = np.stack(demo_pcds_left, axis=0)  # [T, N, 3]
@@ -279,6 +289,13 @@ class BimanualRunningDataset(Dataset):
         graph_data.demo_T_w_right = torch.tensor(demo_T_right, dtype=torch.float32).unsqueeze(0)
         graph_data.demo_grips_left = torch.tensor(demo_grips_left, dtype=torch.float32).unsqueeze(0)
         graph_data.demo_grips_right = torch.tensor(demo_grips_right, dtype=torch.float32).unsqueeze(0)
+        demo_T_left_to_right = np.stack([
+            np.linalg.inv(demo_T_left[i]) @ demo_T_right[i]
+            for i in range(len(demo_indices))
+        ], axis=0)
+        graph_data.demo_T_left_to_right = torch.tensor(
+            demo_T_left_to_right, dtype=torch.float32
+        ).unsqueeze(0)
         
         # Demo point clouds
         demo_pcds = [trajectory.pcds[i] for i in demo_indices]
@@ -363,7 +380,13 @@ def collate_bimanual(batch: List[BimanualGraphData]) -> BimanualGraphData:
     batch_size = len(batch)
     
     # Keys that have demo dimension [1, ...] that should be concatenated along dim=1
-    demo_keys = ['demo_T_w_left', 'demo_T_w_right', 'demo_grips_left', 'demo_grips_right']
+    demo_keys = [
+        'demo_T_w_left',
+        'demo_T_w_right',
+        'demo_grips_left',
+        'demo_grips_right',
+        'demo_T_left_to_right',
+    ]
     
     for key in sample.keys():
         values = [getattr(b, key) for b in batch]

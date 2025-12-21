@@ -277,11 +277,11 @@ class BimanualAGI(nn.Module):
         actions_flat = actions.view(-1, 4, 4)  # [B*P, 4, 4]
         
         # Transform: R^T @ (p - t)
+        current_obs = current_obs - actions_flat[:, :3, 3][:, None, :]
         current_obs = torch.bmm(
             actions_flat[:, :3, :3].transpose(1, 2),
             current_obs.permute(0, 2, 1)
         ).permute(0, 2, 1)
-        current_obs = current_obs - actions_flat[:, :3, 3][:, None, :]
         
         # Encode
         action_batch = torch.arange(
