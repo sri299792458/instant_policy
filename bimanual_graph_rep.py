@@ -1,0 +1,786 @@
+"""
+Bimanual Graph Representation for Instant Policy.
+
+This module extends the original Instant Policy graph structure to handle
+two end-effectors with proper spatial invariance and coordination edges.
+
+Key Design Decisions:
+1. Dual Egocentric Frames: Each arm has its own egocentric view of the scene
+2. Relative Cross-Arm Edges: Arms are connected via relative transforms
+3. Coordination Edges: Action nodes of both arms can attend to each other
+4. Frame-Consistent Edge Attributes: All edge attributes encode relative geometry
+"""
+import torch
+import torch.nn as nn
+from torch_geometric.data import HeteroData
+from typing import Dict, Tuple, Optional
+
+
+class PositionalEncoder(nn.Module):
+    """Sine-cosine positional encoder for 3D positions."""
+    
+    def __init__(self, d_input: int, n_freqs: int, log_space: bool = True, 
+                 add_original: bool = True, scale: float = 1.0):
+        super().__init__()
+        self.d_input = d_input
+        self.n_freqs = n_freqs
+        self.scale = scale
+        self.add_original = add_original
+        
+        if log_space:
+            freq_bands = 2. ** torch.linspace(0., n_freqs - 1, n_freqs)
+        else:
+            freq_bands = torch.linspace(2. ** 0., 2. ** (n_freqs - 1), n_freqs)
+        
+        self.register_buffer('freq_bands', freq_bands)
+        
+        self.d_output = d_input * (2 * n_freqs)
+        if add_original:
+            self.d_output += d_input
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input positions [..., d_input]
+        Returns:
+            Encoded positions [..., d_output]
+        """
+        x_scaled = x / self.scale
+        encodings = []
+        
+        if self.add_original:
+            encodings.append(x_scaled)
+        
+        for freq in self.freq_bands:
+            encodings.append(torch.sin(x_scaled * freq))
+            encodings.append(torch.cos(x_scaled * freq))
+        
+        return torch.cat(encodings, dim=-1)
+
+
+class SinusoidalTimeEmb(nn.Module):
+    """Sinusoidal embedding for diffusion timestep."""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        device = t.device
+        half_dim = self.dim // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        # Ensure t is at least 1D
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        emb = t.float()[:, None] * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        return emb
+
+
+class BimanualGraphRep(nn.Module):
+    """
+    Bimanual Graph Representation.
+    
+    Node Types:
+        - scene_left: Scene points in left EE frame
+        - scene_right: Scene points in right EE frame  
+        - gripper_left: Left gripper keypoints
+        - gripper_right: Right gripper keypoints
+    
+    Edge Types:
+        Local (within same arm's egocentric frame):
+            - (scene_X, rel, scene_X): Scene-to-scene within same arm
+            - (scene_X, rel, gripper_X): Scene-to-gripper within same arm
+            - (gripper_X, rel, gripper_X): Gripper self-edges
+        
+        Temporal (within demonstrations):
+            - (gripper_X, demo, gripper_X): Between timesteps in demo
+        
+        Context (demo to current):
+            - (gripper_X, cond, gripper_X): Demo gripper to current gripper
+        
+        Action (current to future):
+            - (gripper_X, time_action, gripper_X): Between action timesteps
+            - (gripper_X, rel_cond, gripper_X): Current to first action
+        
+        Cross-Arm Coordination:
+            - (gripper_left, cross, gripper_right): Left observes right
+            - (gripper_right, cross, gripper_left): Right observes left
+            - (gripper_left, cross_action, gripper_right): Action coordination
+            - (gripper_right, cross_action, gripper_left): Action coordination
+    """
+    
+    def __init__(self, config: Dict):
+        super().__init__()
+        
+        # Store configuration
+        self.batch_size = config['batch_size']
+        self.num_demos = config['num_demos']
+        self.traj_horizon = config['traj_horizon']
+        self.num_scene_nodes = config['num_scenes_nodes']
+        self.num_freqs = config['local_num_freq']
+        self.device = config['device']
+        self.embd_dim = config['local_nn_dim']
+        self.pred_horizon = config['pre_horizon']
+        self.pos_in_nodes = config['pos_in_nodes']
+        self.use_cross_arm = config.get('use_cross_arm_attention', True)
+        
+        # Gripper keypoints (6 points defining gripper geometry)
+        self.gripper_keypoints = config['gripper_keypoints'].to(self.device)
+        self.num_g_nodes = len(self.gripper_keypoints)
+        
+        # Embedding dimensions
+        self.g_state_dim = 64   # Gripper state embedding dimension
+        self.d_time_dim = 64    # Diffusion time embedding dimension
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoder(3, self.num_freqs, log_space=True, 
+                                              add_original=True, scale=1.0)
+        self.edge_dim = self.pos_encoder.d_output * 2  # Source and dest encodings
+        
+        # Time embedding for diffusion
+        self.time_emb = SinusoidalTimeEmb(self.d_time_dim)
+        
+        # Gripper state projection
+        self.gripper_proj = nn.Linear(1, self.g_state_dim)
+        
+        # Learnable embeddings for gripper nodes
+        # We have: demo gripper nodes + current gripper + action gripper nodes
+        # For each arm: traj_horizon * num_g_nodes (demo) + num_g_nodes (current) + pred_horizon * num_g_nodes (action)
+        num_gripper_embeddings = self.num_g_nodes * (self.pred_horizon + 1)  # Current + action nodes
+        self.gripper_embds_left = nn.Embedding(num_gripper_embeddings, 
+                                                self.embd_dim - self.g_state_dim)
+        self.gripper_embds_right = nn.Embedding(num_gripper_embeddings,
+                                                 self.embd_dim - self.g_state_dim)
+        
+        # Edge type embeddings (learnable biases for different edge types)
+        self.cond_edge_embd = nn.Embedding(1, self.edge_dim)
+        self.demo_action_edge_embd = nn.Embedding(1, self.edge_dim)
+        self.cross_arm_edge_embd = nn.Embedding(1, self.edge_dim)
+        self.cross_action_edge_embd = nn.Embedding(1, self.edge_dim)
+        
+        # Define node and edge types
+        self.node_types = ['scene_left', 'scene_right', 'gripper_left', 'gripper_right']
+        self.edge_types = self._define_edge_types()
+        
+        # Graph structure (initialized in initialise_graph)
+        self.graph = None
+        
+    def _define_edge_types(self):
+        """Define all edge types for the bimanual graph."""
+        edge_types = [
+            # =============== LOCAL SPATIAL (Gripper only - scene edges use rel_demo/rel_action) ===============
+            ('gripper_left', 'rel', 'gripper_left'),
+            ('gripper_right', 'rel', 'gripper_right'),
+            
+            # =============== DEMO TEMPORAL ===============
+            ('gripper_left', 'demo', 'gripper_left'),
+            ('gripper_right', 'demo', 'gripper_right'),
+            
+            # =============== CONTEXT: Demo → Current ===============
+            ('gripper_left', 'cond', 'gripper_left'),
+            ('gripper_right', 'cond', 'gripper_right'),
+            
+            # =============== ACTION: Current/Action → Action ===============
+            ('gripper_left', 'time_action', 'gripper_left'),
+            ('gripper_right', 'time_action', 'gripper_right'),
+            ('gripper_left', 'rel_cond', 'gripper_left'),
+            ('gripper_right', 'rel_cond', 'gripper_right'),
+            
+            # =============== SCENE-SCENE AND SCENE-GRIPPER ===============
+            ('scene_left', 'rel_action', 'gripper_left'),
+            ('scene_right', 'rel_action', 'gripper_right'),
+            ('scene_left', 'rel_demo', 'gripper_left'),
+            ('scene_right', 'rel_demo', 'gripper_right'),
+            ('scene_left', 'rel_action', 'scene_left'),
+            ('scene_right', 'rel_action', 'scene_right'),
+            ('scene_left', 'rel_demo', 'scene_left'),
+            ('scene_right', 'rel_demo', 'scene_right'),
+        ]
+        
+        if self.use_cross_arm:
+            edge_types.extend([
+                # =============== CROSS-ARM COORDINATION ===============
+                # Current timestep cross-arm visibility
+                ('gripper_left', 'cross', 'gripper_right'),
+                ('gripper_right', 'cross', 'gripper_left'),
+                
+                # Action coordination (left actions see right actions)
+                ('gripper_left', 'cross_action', 'gripper_right'),
+                ('gripper_right', 'cross_action', 'gripper_left'),
+                
+                # Demo cross-arm (at same timestep)
+                ('gripper_left', 'cross_demo', 'gripper_right'),
+                ('gripper_right', 'cross_demo', 'gripper_left'),
+            ])
+        
+        return edge_types
+    
+    def _create_dense_edge_idx(self, num_source: int, num_dest: int) -> torch.Tensor:
+        """Create dense (fully connected) edge indices."""
+        return torch.cartesian_prod(
+            torch.arange(num_source, dtype=torch.long, device=self.device),
+            torch.arange(num_dest, dtype=torch.long, device=self.device)
+        ).t().contiguous()
+    
+    def _get_node_info(self, arm: str) -> Dict[str, torch.Tensor]:
+        """
+        Compute node information (batch, timestep, etc.) for one arm.
+        
+        Returns dict with indices for:
+            - scene nodes: [B * num_demos * traj_horizon * num_scene_nodes] + [B * num_scene_nodes] + [B * pred_horizon * num_scene_nodes]
+            - gripper nodes: [B * num_demos * traj_horizon * num_g_nodes] + [B * num_g_nodes] + [B * pred_horizon * num_g_nodes]
+        """
+        B = self.batch_size
+        D = self.num_demos
+        T = self.traj_horizon
+        S = self.num_scene_nodes
+        G = self.num_g_nodes
+        P = self.pred_horizon
+        
+        # Helper for creating index tensors
+        def arange(n):
+            return torch.arange(n, device=self.device)
+        
+        # ==================== Scene Nodes ====================
+        # Demo scene nodes: [B, D, T, S]
+        scene_batch_demo = arange(B)[:, None, None, None].expand(B, D, T, S).reshape(-1)
+        scene_traj_demo = arange(T)[None, None, :, None].expand(B, D, T, S).reshape(-1)
+        scene_demo_demo = arange(D)[None, :, None, None].expand(B, D, T, S).reshape(-1)
+        
+        # Current scene nodes: [B, S]
+        scene_batch_curr = arange(B)[:, None].expand(B, S).reshape(-1)
+        scene_traj_curr = torch.full((B * S,), T, device=self.device)
+        scene_demo_curr = torch.full((B * S,), D, device=self.device)  # D means "current"
+        
+        # Action scene nodes: [B, P, S]
+        scene_batch_act = arange(B)[:, None, None].expand(B, P, S).reshape(-1)
+        scene_traj_act = (arange(P)[None, :, None].expand(B, P, S) + T + 1).reshape(-1)
+        scene_demo_act = torch.full((B * P * S,), D, device=self.device)
+        
+        scene_info = {
+            'batch': torch.cat([scene_batch_demo, scene_batch_curr, scene_batch_act]),
+            'traj': torch.cat([scene_traj_demo, scene_traj_curr, scene_traj_act]),
+            'demo': torch.cat([scene_demo_demo, scene_demo_curr, scene_demo_act]),
+        }
+        
+        # ==================== Gripper Nodes ====================
+        # Demo gripper nodes: [B, D, T, G]
+        grip_batch_demo = arange(B)[:, None, None, None].expand(B, D, T, G).reshape(-1)
+        grip_time_demo = arange(T)[None, None, :, None].expand(B, D, T, G).reshape(-1)
+        grip_node_demo = arange(G)[None, None, None, :].expand(B, D, T, G).reshape(-1)
+        grip_demo_demo = arange(D)[None, :, None, None].expand(B, D, T, G).reshape(-1)
+        
+        # Current gripper nodes: [B, G]
+        grip_batch_curr = arange(B)[:, None].expand(B, G).reshape(-1)
+        grip_time_curr = torch.full((B * G,), T, dtype=torch.long, device=self.device)
+        grip_node_curr = arange(G)[None, :].expand(B, G).reshape(-1)
+        grip_demo_curr = torch.full((B * G,), D, device=self.device)
+        
+        # Action gripper nodes: [B, P, G]
+        grip_batch_act = arange(B)[:, None, None].expand(B, P, G).reshape(-1)
+        grip_time_act = (arange(P)[None, :, None].expand(B, P, G) + T + 1).reshape(-1).long()
+        grip_node_act = arange(G)[None, None, :].expand(B, P, G).reshape(-1)
+        grip_demo_act = torch.full((B * P * G,), D, device=self.device)
+        
+        # Embedding indices for gripper nodes
+        # Demo nodes: just use node index (0 to G-1)
+        grip_embd_demo = grip_node_demo
+        # Current nodes: use G + node index
+        grip_embd_curr = grip_node_curr
+        # Action nodes: use node index + G * action_step
+        grip_embd_act = grip_node_act + G * (grip_time_act - T - 1)
+        
+        gripper_info = {
+            'batch': torch.cat([grip_batch_demo, grip_batch_curr, grip_batch_act]),
+            'time': torch.cat([grip_time_demo, grip_time_curr, grip_time_act]),
+            'node': torch.cat([grip_node_demo, grip_node_curr, grip_node_act]),
+            'embd': torch.cat([grip_embd_demo, grip_embd_curr, grip_embd_act]).long(),
+            'demo': torch.cat([grip_demo_demo, grip_demo_curr, grip_demo_act]),
+        }
+        
+        return {'scene': scene_info, 'gripper': gripper_info}
+    
+    def initialise_graph(self):
+        """Initialize the graph structure with edge indices."""
+        self.graph = HeteroData()
+        
+        # Get node info for both arms
+        node_info_left = self._get_node_info('left')
+        node_info_right = self._get_node_info('right')
+        
+        # Store node info in graph
+        for arm, info in [('left', node_info_left), ('right', node_info_right)]:
+            for node_type in ['scene', 'gripper']:
+                prefix = f'{node_type}_{arm}'
+                for key, val in info[node_type].items():
+                    setattr(self.graph, f'{prefix}_{key}', val)
+        
+        # Create edge indices
+        self._create_local_edges('left', node_info_left)
+        self._create_local_edges('right', node_info_right)
+        
+        if self.use_cross_arm:
+            self._create_cross_arm_edges(node_info_left, node_info_right)
+    
+    def _create_local_edges(self, arm: str, node_info: Dict):
+        """Create edges for one arm's local subgraph."""
+        scene_key = f'scene_{arm}'
+        grip_key = f'gripper_{arm}'
+        
+        s_info = node_info['scene']
+        g_info = node_info['gripper']
+        
+        num_scene = s_info['batch'].shape[0]
+        num_grip = g_info['batch'].shape[0]
+        
+        # Dense edge indices
+        dense_s_s = self._create_dense_edge_idx(num_scene, num_scene)
+        dense_s_g = self._create_dense_edge_idx(num_scene, num_grip)
+        dense_g_g = self._create_dense_edge_idx(num_grip, num_grip)
+        
+        T = self.traj_horizon
+        
+        # ==================== Scene-Scene Edges ====================
+        # Same batch, same timestep, same demo
+        s_rel_s_mask = (
+            (s_info['batch'][dense_s_s[0]] == s_info['batch'][dense_s_s[1]]) &
+            (s_info['traj'][dense_s_s[0]] == s_info['traj'][dense_s_s[1]]) &
+            (s_info['demo'][dense_s_s[0]] == s_info['demo'][dense_s_s[1]])
+        )
+        
+        # Split into demo and action
+        s_is_action = s_info['traj'] > T
+        s_rel_s_action = s_rel_s_mask & s_is_action[dense_s_s[0]] & s_is_action[dense_s_s[1]]
+        s_rel_s_demo = s_rel_s_mask & ~s_rel_s_action
+        
+        self.graph[(scene_key, 'rel_demo', scene_key)].edge_index = dense_s_s[:, s_rel_s_demo]
+        self.graph[(scene_key, 'rel_action', scene_key)].edge_index = dense_s_s[:, s_rel_s_action]
+        
+        # ==================== Scene-Gripper Edges ====================
+        s_rel_g_mask = (
+            (s_info['batch'][dense_s_g[0]] == g_info['batch'][dense_s_g[1]]) &
+            (s_info['traj'][dense_s_g[0]] == g_info['time'][dense_s_g[1]]) &
+            (s_info['demo'][dense_s_g[0]] == g_info['demo'][dense_s_g[1]])
+        )
+        
+        g_is_action = g_info['time'] > T
+        s_rel_g_action = s_rel_g_mask & s_is_action[dense_s_g[0]] & g_is_action[dense_s_g[1]]
+        s_rel_g_demo = s_rel_g_mask & ~s_rel_g_action
+        
+        self.graph[(scene_key, 'rel_demo', grip_key)].edge_index = dense_s_g[:, s_rel_g_demo]
+        self.graph[(scene_key, 'rel_action', grip_key)].edge_index = dense_s_g[:, s_rel_g_action]
+        
+        # ==================== Gripper-Gripper Local Edges ====================
+        # Same batch, same timestep, same demo (local spatial)
+        g_rel_g_mask = (
+            (g_info['batch'][dense_g_g[0]] == g_info['batch'][dense_g_g[1]]) &
+            (g_info['time'][dense_g_g[0]] == g_info['time'][dense_g_g[1]]) &
+            (g_info['demo'][dense_g_g[0]] == g_info['demo'][dense_g_g[1]])
+        )
+        self.graph[(grip_key, 'rel', grip_key)].edge_index = dense_g_g[:, g_rel_g_mask]
+        
+        # ==================== Demo Temporal Edges ====================
+        # Within demo, consecutive timesteps (t -> t-1, backwards looking)
+        g_demo_mask = (
+            (g_info['batch'][dense_g_g[0]] == g_info['batch'][dense_g_g[1]]) &
+            (g_info['time'][dense_g_g[0]] < T) &  # Source is demo
+            (g_info['time'][dense_g_g[1]] < T) &  # Dest is demo
+            (g_info['demo'][dense_g_g[0]] == g_info['demo'][dense_g_g[1]]) &  # Same demo
+            (g_info['time'][dense_g_g[1]] - g_info['time'][dense_g_g[0]] == -1)  # Consecutive
+        )
+        self.graph[(grip_key, 'demo', grip_key)].edge_index = dense_g_g[:, g_demo_mask]
+        
+        # ==================== Context Edges (Demo → Current) ====================
+        g_cond_mask = (
+            (g_info['batch'][dense_g_g[0]] == g_info['batch'][dense_g_g[1]]) &
+            (g_info['time'][dense_g_g[0]] < T) &  # Source is demo
+            (g_info['time'][dense_g_g[1]] == T)   # Dest is current
+        )
+        self.graph[(grip_key, 'cond', grip_key)].edge_index = dense_g_g[:, g_cond_mask]
+        
+        # ==================== Action Temporal Edges ====================
+        # Current/action → action (forward looking)
+        g_time_action_mask = (
+            (g_info['batch'][dense_g_g[0]] == g_info['batch'][dense_g_g[1]]) &
+            (g_info['time'][dense_g_g[0]] >= T) &  # Source is current or action
+            (g_info['time'][dense_g_g[1]] > T) &   # Dest is action
+            (g_info['time'][dense_g_g[0]] != g_info['time'][dense_g_g[1]])  # Different timesteps
+        )
+        
+        # Split: current→action vs action→action
+        g_curr_to_action = g_time_action_mask & (g_info['time'][dense_g_g[0]] == T)
+        g_action_to_action = g_time_action_mask & ~g_curr_to_action
+        
+        self.graph[(grip_key, 'rel_cond', grip_key)].edge_index = dense_g_g[:, g_curr_to_action]
+        self.graph[(grip_key, 'time_action', grip_key)].edge_index = dense_g_g[:, g_action_to_action]
+    
+    def _create_cross_arm_edges(self, info_left: Dict, info_right: Dict):
+        """Create edges connecting left and right arms."""
+        g_left = info_left['gripper']
+        g_right = info_right['gripper']
+        
+        num_left = g_left['batch'].shape[0]
+        num_right = g_right['batch'].shape[0]
+        
+        # Dense cross-arm edge indices
+        dense_lr = self._create_dense_edge_idx(num_left, num_right)
+        dense_rl = self._create_dense_edge_idx(num_right, num_left)
+        
+        T = self.traj_horizon
+        
+        # ==================== Current Cross-Arm ====================
+        # Left current sees right current
+        cross_lr_curr = (
+            (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
+            (g_left['time'][dense_lr[0]] == T) &
+            (g_right['time'][dense_lr[1]] == T)
+        )
+        self.graph[('gripper_left', 'cross', 'gripper_right')].edge_index = dense_lr[:, cross_lr_curr]
+        
+        cross_rl_curr = (
+            (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
+            (g_right['time'][dense_rl[0]] == T) &
+            (g_left['time'][dense_rl[1]] == T)
+        )
+        self.graph[('gripper_right', 'cross', 'gripper_left')].edge_index = dense_rl[:, cross_rl_curr]
+        
+        # ==================== Action Cross-Arm ====================
+        # Left action nodes see right action nodes at same action timestep
+        cross_lr_act = (
+            (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
+            (g_left['time'][dense_lr[0]] > T) &
+            (g_right['time'][dense_lr[1]] > T) &
+            (g_left['time'][dense_lr[0]] == g_right['time'][dense_lr[1]])  # Same action timestep
+        )
+        self.graph[('gripper_left', 'cross_action', 'gripper_right')].edge_index = dense_lr[:, cross_lr_act]
+        
+        cross_rl_act = (
+            (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
+            (g_right['time'][dense_rl[0]] > T) &
+            (g_left['time'][dense_rl[1]] > T) &
+            (g_right['time'][dense_rl[0]] == g_left['time'][dense_rl[1]])
+        )
+        self.graph[('gripper_right', 'cross_action', 'gripper_left')].edge_index = dense_rl[:, cross_rl_act]
+        
+        # ==================== Demo Cross-Arm ====================
+        # Same timestep in demo
+        cross_lr_demo = (
+            (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
+            (g_left['time'][dense_lr[0]] < T) &
+            (g_right['time'][dense_lr[1]] < T) &
+            (g_left['time'][dense_lr[0]] == g_right['time'][dense_lr[1]]) &
+            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]])  # Same demo
+        )
+        self.graph[('gripper_left', 'cross_demo', 'gripper_right')].edge_index = dense_lr[:, cross_lr_demo]
+        
+        cross_rl_demo = (
+            (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
+            (g_right['time'][dense_rl[0]] < T) &
+            (g_left['time'][dense_rl[1]] < T) &
+            (g_right['time'][dense_rl[0]] == g_left['time'][dense_rl[1]]) &
+            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]])
+        )
+        self.graph[('gripper_right', 'cross_demo', 'gripper_left')].edge_index = dense_rl[:, cross_rl_demo]
+    
+    def transform_gripper_nodes(self, gripper_keypoints: torch.Tensor, 
+                                 T: torch.Tensor) -> torch.Tensor:
+        """
+        Transform gripper keypoints by SE(3) transformations.
+        
+        Args:
+            gripper_keypoints: [B, D, T, G, 3] or [B, T, G, 3] or [B, G, 3]
+            T: [B, D, T, 4, 4] or [B, T, 4, 4] or [B, 4, 4] - transformations
+        
+        Returns:
+            Transformed keypoints with same shape as input
+        """
+        original_shape = gripper_keypoints.shape
+        
+        # Reshape to [N, G, 3] for batch processing
+        if len(original_shape) == 5:  # [B, D, T, G, 3]
+            B, D, T_, G, _ = original_shape
+            kp = gripper_keypoints.reshape(-1, G, 3)
+            transforms = T.reshape(-1, 4, 4)
+        elif len(original_shape) == 4:  # [B, T, G, 3]
+            B, T_, G, _ = original_shape
+            kp = gripper_keypoints.reshape(-1, G, 3)
+            transforms = T.reshape(-1, 4, 4)
+        else:  # [B, G, 3]
+            B, G, _ = original_shape
+            kp = gripper_keypoints
+            transforms = T
+        
+        # Apply transformation: T @ kp
+        kp_transformed = torch.bmm(transforms[:, :3, :3], kp.transpose(1, 2))  # [N, 3, G]
+        kp_transformed = kp_transformed.transpose(1, 2) + transforms[:, :3, 3:4].transpose(1, 2)  # [N, G, 3]
+        
+        return kp_transformed.reshape(original_shape)
+    
+    def update_graph(self, data) -> HeteroData:
+        """
+        Update graph with actual node features and edge attributes from data.
+        
+        Args:
+            data: BimanualGraphData with all required tensors
+        
+        Returns:
+            Updated HeteroData graph
+        """
+        B = self.batch_size
+        D = self.num_demos
+        T = self.traj_horizon
+        G = self.num_g_nodes
+        P = self.pred_horizon
+        
+        # ==================== Scene Node Features ====================
+        for arm in ['left', 'right']:
+            scene_key = f'scene_{arm}'
+            
+            # Concatenate demo, current, and action scene embeddings
+            demo_embds = getattr(data, f'demo_scene_embds_{arm}')[:, :D]  # [B, D, T, S, dim]
+            live_embds = getattr(data, f'live_scene_embds_{arm}')         # [B, S, dim]
+            action_embds = getattr(data, f'action_scene_embds_{arm}')     # [B, P, S, dim]
+            
+            demo_pos = getattr(data, f'demo_scene_pos_{arm}')[:, :D]
+            live_pos = getattr(data, f'live_scene_pos_{arm}')
+            action_pos = getattr(data, f'action_scene_pos_{arm}')
+            
+            scene_embds = torch.cat([
+                demo_embds.reshape(-1, self.embd_dim),
+                live_embds.reshape(-1, self.embd_dim),
+                action_embds.reshape(-1, self.embd_dim),
+            ], dim=0)
+            
+            scene_pos = torch.cat([
+                demo_pos.reshape(-1, 3),
+                live_pos.reshape(-1, 3),
+                action_pos.reshape(-1, 3),
+            ], dim=0)
+            
+            self.graph[scene_key].x = scene_embds
+            self.graph[scene_key].pos = scene_pos
+            
+            if self.pos_in_nodes:
+                self.graph[scene_key].x = torch.cat([
+                    self.graph[scene_key].x,
+                    self.pos_encoder(self.graph[scene_key].pos)
+                ], dim=-1)
+        
+        # ==================== Gripper Node Features ====================
+        for arm in ['left', 'right']:
+            grip_key = f'gripper_{arm}'
+            
+            # Get poses and gripper states
+            demo_T = getattr(data, f'demo_T_w_{arm}')[:, :D]  # [B, D, T, 4, 4]
+            actions_T = getattr(data, f'actions_{arm}')       # [B, P, 4, 4]
+            demo_grips = getattr(data, f'demo_grips_{arm}')[:, :D]  # [B, D, T]
+            current_grip = getattr(data, f'current_grip_{arm}')  # [B]
+            action_grips = getattr(data, f'actions_grip_{arm}')  # [B, P]
+            
+            # Compute gripper node positions
+            base_kp = self.gripper_keypoints[None, None, None, :, :]  # [1, 1, 1, G, 3]
+            
+            # Demo gripper positions (in world frame, but we transform to local)
+            demo_kp = base_kp.expand(B, D, T, G, 3)
+            demo_kp_world = self.transform_gripper_nodes(demo_kp, demo_T)
+            
+            # Current gripper positions (at origin in local frame)
+            curr_kp = self.gripper_keypoints[None, :, :].expand(B, G, 3)
+            
+            # Action gripper positions
+            action_kp = base_kp[:, 0].expand(B, P, G, 3)
+            action_kp_transformed = self.transform_gripper_nodes(action_kp, actions_T)
+            
+            # Concatenate positions
+            grip_pos = torch.cat([
+                demo_kp_world.reshape(-1, 3),  # For now, keep in world - will compute relative in edges
+                curr_kp.reshape(-1, 3),
+                action_kp_transformed.reshape(-1, 3),
+            ], dim=0)
+            
+            # Compute gripper state embeddings
+            demo_grip_embd = self.gripper_proj(demo_grips.unsqueeze(-1))  # [B, D, T, g_state_dim]
+            demo_grip_embd = demo_grip_embd[:, :, :, None, :].expand(B, D, T, G, -1)
+            
+            curr_grip_embd = self.gripper_proj(current_grip.unsqueeze(-1))  # [B, g_state_dim]
+            curr_grip_embd = curr_grip_embd[:, None, :].expand(B, G, -1)
+            
+            action_grip_embd = self.gripper_proj(action_grips.unsqueeze(-1))  # [B, P, g_state_dim]
+            action_grip_embd = action_grip_embd[:, :, None, :].expand(B, P, G, -1)
+            
+            grip_state_embd = torch.cat([
+                demo_grip_embd.reshape(-1, self.g_state_dim),
+                curr_grip_embd.reshape(-1, self.g_state_dim),
+                action_grip_embd.reshape(-1, self.g_state_dim),
+            ], dim=0)
+            
+            # Get learnable embeddings
+            embd_indices = getattr(self.graph, f'{grip_key}_embd')
+            gripper_embds = getattr(self, f'gripper_embds_{arm}')
+            learned_embd = gripper_embds(embd_indices % gripper_embds.num_embeddings)
+            
+            # Add diffusion time embedding to action nodes
+            time_mask = getattr(self.graph, f'{grip_key}_time') > T
+            if time_mask.any():
+                d_time_embd = self.time_emb(data.diff_time.squeeze())  # [B, d_time_dim]
+                d_time_expanded = d_time_embd[:, None, None, :].expand(B, P, G, -1).reshape(-1, self.d_time_dim)
+                
+                # Replace last d_time_dim dimensions for action nodes
+                action_start_idx = B * D * T * G + B * G
+                learned_embd[action_start_idx:, -self.d_time_dim:] = d_time_expanded
+            
+            # Combine all embeddings
+            grip_embd = torch.cat([learned_embd, grip_state_embd], dim=-1)
+            
+            self.graph[grip_key].x = grip_embd
+            self.graph[grip_key].pos = grip_pos
+            
+            if self.pos_in_nodes:
+                self.graph[grip_key].x = torch.cat([
+                    self.graph[grip_key].x,
+                    self.pos_encoder(self.graph[grip_key].pos)
+                ], dim=-1)
+        
+        # ==================== Edge Attributes ====================
+        self._compute_edge_attributes(data)
+        
+        return self.graph
+    
+    def _compute_edge_attributes(self, data):
+        """Compute edge attributes for all edge types."""
+        
+        # Local edges (relative positions)
+        for arm in ['left', 'right']:
+            scene_key = f'scene_{arm}'
+            grip_key = f'gripper_{arm}'
+            
+            # Scene-scene edges
+            for edge_type in ['rel_demo', 'rel_action']:
+                self._add_rel_edge_attr(scene_key, scene_key, edge_type)
+            
+            # Scene-gripper edges  
+            for edge_type in ['rel_demo', 'rel_action']:
+                self._add_rel_edge_attr(scene_key, grip_key, edge_type)
+            
+            # Gripper-gripper local edges
+            self._add_rel_edge_attr(grip_key, grip_key, 'rel')
+            
+            # Context edges (with learnable embedding)
+            edge_key = (grip_key, 'cond', grip_key)
+            if edge_key in self.graph.edge_types:
+                num_edges = self.graph[edge_key].edge_index.shape[1]
+                base_attr = self._compute_rel_attr(grip_key, grip_key, 'cond')
+                learned = self.cond_edge_embd(torch.zeros(num_edges, device=self.device).long())
+                self.graph[edge_key].edge_attr = base_attr + learned
+            
+            # Temporal edges
+            for edge_type in ['demo', 'time_action', 'rel_cond']:
+                self._add_rel_edge_attr(grip_key, grip_key, edge_type)
+        
+        # Cross-arm edges
+        if self.use_cross_arm:
+            self._compute_cross_arm_edge_attrs(data)
+    
+    def _add_rel_edge_attr(self, src: str, dst: str, edge_type: str):
+        """Add relative position edge attributes."""
+        edge_key = (src, edge_type, dst)
+        if edge_key not in self.graph.edge_types:
+            return
+        
+        edge_attr = self._compute_rel_attr(src, dst, edge_type)
+        self.graph[edge_key].edge_attr = edge_attr
+    
+    def _compute_rel_attr(self, src: str, dst: str, edge_type: str) -> torch.Tensor:
+        """Compute relative position encoding for edges."""
+        edge_key = (src, edge_type, dst)
+        edge_index = self.graph[edge_key].edge_index
+        
+        # Handle empty edge case
+        if edge_index.shape[1] == 0:
+            return torch.zeros((0, self.edge_dim), device=self.device)
+        
+        src_pos = self.graph[src].pos[edge_index[0]]
+        dst_pos = self.graph[dst].pos[edge_index[1]]
+        
+        rel_pos = dst_pos - src_pos
+        
+        # Encode both relative position and rotated relative position
+        # (The original IP uses this for rotation awareness)
+        return torch.cat([
+            self.pos_encoder(rel_pos),
+            self.pos_encoder(rel_pos),  # In full implementation, apply rotation here
+        ], dim=-1)
+    
+    def _compute_cross_arm_edge_attrs(self, data):
+        """Compute edge attributes for cross-arm edges."""
+        # Cross-arm edges encode the relative transform between arms
+        T_left_to_right = data.current_T_left_to_right  # [B, 4, 4]
+        
+        for edge_key in [
+            ('gripper_left', 'cross', 'gripper_right'),
+            ('gripper_left', 'cross_action', 'gripper_right'),
+            ('gripper_left', 'cross_demo', 'gripper_right'),
+        ]:
+            if edge_key not in self.graph.edge_types:
+                continue
+            
+            edge_index = self.graph[edge_key].edge_index
+            num_edges = edge_index.shape[1]
+            
+            # Get positions and compute relative
+            src_pos = self.graph['gripper_left'].pos[edge_index[0]]
+            dst_pos = self.graph['gripper_right'].pos[edge_index[1]]
+            
+            # Transform src_pos to right frame using T_left_to_right
+            # For now, simplified: just use relative positions
+            rel_pos = dst_pos - src_pos
+            
+            base_attr = torch.cat([
+                self.pos_encoder(rel_pos),
+                self.pos_encoder(rel_pos),
+            ], dim=-1)
+            
+            # Add learnable embedding for cross-arm
+            if 'action' in edge_key[1]:
+                learned = self.cross_action_edge_embd(torch.zeros(num_edges, device=self.device).long())
+            else:
+                learned = self.cross_arm_edge_embd(torch.zeros(num_edges, device=self.device).long())
+            
+            self.graph[edge_key].edge_attr = base_attr + learned
+        
+        # Reverse direction edges
+        for edge_key in [
+            ('gripper_right', 'cross', 'gripper_left'),
+            ('gripper_right', 'cross_action', 'gripper_left'),
+            ('gripper_right', 'cross_demo', 'gripper_left'),
+        ]:
+            if edge_key not in self.graph.edge_types:
+                continue
+            
+            edge_index = self.graph[edge_key].edge_index
+            num_edges = edge_index.shape[1]
+            
+            src_pos = self.graph['gripper_right'].pos[edge_index[0]]
+            dst_pos = self.graph['gripper_left'].pos[edge_index[1]]
+            rel_pos = dst_pos - src_pos
+            
+            base_attr = torch.cat([
+                self.pos_encoder(rel_pos),
+                self.pos_encoder(rel_pos),
+            ], dim=-1)
+            
+            if 'action' in edge_key[1]:
+                learned = self.cross_action_edge_embd(torch.zeros(num_edges, device=self.device).long())
+            else:
+                learned = self.cross_arm_edge_embd(torch.zeros(num_edges, device=self.device).long())
+            
+            self.graph[edge_key].edge_attr = base_attr + learned
+    
+    def reinit_graphs(self, batch_size: int, num_demos: Optional[int] = None):
+        """Reinitialize graph structure for new batch size or number of demos."""
+        self.batch_size = batch_size
+        if num_demos is not None:
+            self.num_demos = num_demos
+        self.initialise_graph()
