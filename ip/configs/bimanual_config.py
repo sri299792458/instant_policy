@@ -36,7 +36,7 @@ def get_config():
     config['shared_scene_encoder'] = True
     
     # Number of scene nodes per arm
-    config['num_scenes_nodes'] = 16  # Per arm (graph expects this, encoder output may vary)
+    config['num_scenes_nodes'] = 16  # Per arm
     
     # Hidden dimensions
     config['local_nn_dim'] = 512

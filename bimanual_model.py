@@ -71,30 +71,102 @@ class BimanualAGI(nn.Module):
         self.graph = BimanualGraphRep(config)
         self.graph.initialise_graph()
         
-        # ============== Graph Transformers ==============
+        # ============== Graph Transformers (Staged) ==============
+        # 1. Local Encoder: Processes local spatial edges (rel)
+        # 2. Cond Encoder: Processes demo context edges (demo, cond, rel_demo, cross_demo)
+        # 3. Action Encoder: Processes action edges (time_action, rel_cond, rel_action, cross_action)
+        
         in_channels = self.local_embd_dim
         if config.get('pos_in_nodes', True):
             in_channels += self.graph.edge_dim // 2
         
-        # Get metadata from the graph representation
-        metadata = (self.graph.node_types, self.graph.edge_types)
+        # Define edge subsets for each encoder
+        # This matches the original IP design + bimanual cross edges
         
-        # Use a single unified encoder that handles all edge types
-        # This is simpler and avoids metadata mismatch issues
-        self.encoder = GraphTransformer(
+        # Local edges: Spatial relations within same timestep
+        local_edges = [
+            ('gripper_left', 'rel', 'gripper_left'),
+            ('gripper_right', 'rel', 'gripper_right'),
+            ('gripper_left', 'cross', 'gripper_right'), # Cross-arm current
+            ('gripper_right', 'cross', 'gripper_left'),
+        ]
+        
+        # Context edges: Demo temporal and demo-to-current
+        cond_edges = [
+            ('gripper_left', 'demo', 'gripper_left'),
+            ('gripper_right', 'demo', 'gripper_right'),
+            ('gripper_left', 'cond', 'gripper_left'),
+            ('gripper_right', 'cond', 'gripper_right'),
+            ('scene_left', 'rel_demo', 'gripper_left'),
+            ('scene_right', 'rel_demo', 'gripper_right'),
+            ('scene_left', 'rel_demo', 'scene_left'),
+            ('scene_right', 'rel_demo', 'scene_right'),
+        ]
+        if self.graph.use_cross_arm:
+            cond_edges.extend([
+                ('gripper_left', 'cross_demo', 'gripper_right'),
+                ('gripper_right', 'cross_demo', 'gripper_left'),
+            ])
+            
+        # Action edges: Future prediction
+        action_edges = [
+            ('gripper_left', 'time_action', 'gripper_left'),
+            ('gripper_right', 'time_action', 'gripper_right'),
+            ('gripper_left', 'rel_cond', 'gripper_left'),
+            ('gripper_right', 'rel_cond', 'gripper_right'),
+            ('scene_left', 'rel_action', 'gripper_left'),
+            ('scene_right', 'rel_action', 'gripper_right'),
+            ('scene_left', 'rel_action', 'scene_left'),
+            ('scene_right', 'rel_action', 'scene_right'),
+        ]
+        if self.graph.use_cross_arm:
+            action_edges.extend([
+                ('gripper_left', 'cross_action', 'gripper_right'),
+                ('gripper_right', 'cross_action', 'gripper_left'),
+            ])
+
+        # Helper to filter metadata for specific edges
+        def filter_metadata(edges):
+            return (self.graph.node_types, [e for e in self.graph.edge_types if e in edges])
+
+        self.local_encoder = GraphTransformer(
             in_channels=in_channels,
             hidden_channels=config['hidden_dim'],
             heads=config['hidden_dim'] // 64,
-            num_layers=self.num_layers * 3,  # More layers to compensate
-            metadata=metadata,
+            num_layers=self.num_layers,
+            metadata=filter_metadata(local_edges),
+            edge_dim=self.graph.edge_dim,
+            dropout=0.0,
+            norm='layer'
+        ).to(config['device'])
+
+        self.cond_encoder = GraphTransformer(
+            in_channels=config['hidden_dim'], # Takes output of local
+            hidden_channels=config['hidden_dim'],
+            heads=config['hidden_dim'] // 64,
+            num_layers=self.num_layers,
+            metadata=filter_metadata(cond_edges),
+            edge_dim=self.graph.edge_dim,
+            dropout=0.0,
+            norm='layer'
+        ).to(config['device'])
+
+        self.action_encoder = GraphTransformer(
+            in_channels=config['hidden_dim'], # Takes output of cond
+            hidden_channels=config['hidden_dim'],
+            heads=config['hidden_dim'] // 64,
+            num_layers=self.num_layers,
+            metadata=filter_metadata(action_edges),
             edge_dim=self.graph.edge_dim,
             dropout=0.0,
             norm='layer'
         ).to(config['device'])
         
-        # Compile encoder for faster execution (20-40% speedup)
+        # Compile encoders
         if config.get('compile_model', True):
-            self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
+            self.local_encoder = torch.compile(self.local_encoder, mode="reduce-overhead")
+            self.cond_encoder = torch.compile(self.cond_encoder, mode="reduce-overhead")
+            self.action_encoder = torch.compile(self.action_encoder, mode="reduce-overhead")
         
         # ============== Prediction Heads (per arm) ==============
         # Left arm
@@ -163,8 +235,9 @@ class BimanualAGI(nn.Module):
         
         # Reshape to [B, D, T, S, dim]
         embds = to_dense_batch(embds, batch, fill_value=0)[0]
+        bs = embds.shape[0] # Dynamic batch size
         embds = embds.view(
-            self.batch_size, self.num_demos, self.traj_horizon,
+            bs, self.num_demos, self.traj_horizon,
             -1, self.local_embd_dim
         )
         
@@ -261,12 +334,29 @@ class BimanualAGI(nn.Module):
         # ============== Graph Update ==============
         self.graph.update_graph(data)
         
-        # ============== Graph Transformer Forward ==============
+        # ============== Graph Transformer Forward (Staged) ==============
         torch.compiler.cudagraph_mark_step_begin()
         
-        # Single unified encoder handles all edge types
-        x_dict = self.encoder(
+        # 1. Local Spatial Processing
+        # Only processes local edges to understand immediate spatial relations
+        x_dict = self.local_encoder(
             self.graph.graph.x_dict,
+            self.graph.graph.edge_index_dict,
+            self.graph.graph.edge_attr_dict
+        )
+        
+        # 2. Context Propagation
+        # Propagates information from demos to current context
+        x_dict = self.cond_encoder(
+            x_dict,
+            self.graph.graph.edge_index_dict, # to_hetero filters automatically? No, we pass all but encoder only uses its subset
+            self.graph.graph.edge_attr_dict
+        )
+        
+        # 3. Action Prediction
+        # Propagates from context to future actions
+        x_dict = self.action_encoder(
+            x_dict,
             self.graph.graph.edge_index_dict,
             self.graph.graph.edge_attr_dict
         )
