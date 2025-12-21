@@ -476,9 +476,12 @@ class BimanualAGI(nn.Module):
         
         return labels
     
-    def get_transformed_node_pos(self, actions: torch.Tensor, arm: str) -> torch.Tensor:
-        """Get gripper keypoints transformed by actions."""
+    def get_transformed_node_pos(self, actions: torch.Tensor, arm: str,
+                                 transform: bool = True) -> torch.Tensor:
+        """Get gripper keypoints, optionally transformed by actions."""
         gripper_points = self.graph.gripper_keypoints[None, None, :, :].repeat(
             actions.shape[0], actions.shape[1], 1, 1
         )
+        if not transform:
+            return gripper_points
         return self.graph.transform_gripper_nodes(gripper_points, actions)

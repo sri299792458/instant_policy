@@ -870,9 +870,11 @@ class BimanualGraphRep(nn.Module):
         
         # Demo transforms (per-timestep, per-demo)
         demo_T_left_to_right = getattr(data, 'demo_T_left_to_right', None)
+        demo_T_w_left = getattr(data, 'demo_T_w_left', None)
+        demo_T_w_right = getattr(data, 'demo_T_w_right', None)
         if demo_T_left_to_right is None:
-            demo_T_left = getattr(data, 'demo_T_w_left', None)
-            demo_T_right = getattr(data, 'demo_T_w_right', None)
+            demo_T_left = demo_T_w_left
+            demo_T_right = demo_T_w_right
             if demo_T_left is not None and demo_T_right is not None:
                 demo_T_left_to_right = torch.matmul(torch.inverse(demo_T_left), demo_T_right)
         if demo_T_left_to_right is not None:
@@ -880,6 +882,16 @@ class BimanualGraphRep(nn.Module):
                 demo_T_left_to_right = demo_T_left_to_right.unsqueeze(0).unsqueeze(1)
             elif demo_T_left_to_right.dim() == 4:
                 demo_T_left_to_right = demo_T_left_to_right.unsqueeze(1)
+        if demo_T_w_left is not None:
+            if demo_T_w_left.dim() == 3:
+                demo_T_w_left = demo_T_w_left.unsqueeze(0).unsqueeze(0)
+            elif demo_T_w_left.dim() == 4:
+                demo_T_w_left = demo_T_w_left.unsqueeze(0)
+        if demo_T_w_right is not None:
+            if demo_T_w_right.dim() == 3:
+                demo_T_w_right = demo_T_w_right.unsqueeze(0).unsqueeze(0)
+            elif demo_T_w_right.dim() == 4:
+                demo_T_w_right = demo_T_w_right.unsqueeze(0)
         
         # Action transforms (per-action-step)
         actions_left = getattr(data, 'actions_left', None)
@@ -932,8 +944,10 @@ class BimanualGraphRep(nn.Module):
                 return
             
             src_key = f'gripper_{src_arm}'
+            dst_key = f'gripper_{dst_arm}'
             src_batch = getattr(self.graph, f'{src_key}_batch')[edge_index[0]]
             src_time = getattr(self.graph, f'{src_key}_time')[edge_index[0]].long()
+            dst_time = getattr(self.graph, f'{dst_key}_time')[edge_index[1]].long()
             
             if edge_type == 'cross':
                 T_src_from_dst = T_curr[src_batch]
@@ -945,13 +959,22 @@ class BimanualGraphRep(nn.Module):
                     action_step = (src_time - T - 1).clamp(min=0, max=max_step)
                     T_src_from_dst = T_action[src_batch, action_step]
             else:  # cross_demo
-                if T_demo is None:
+                if demo_T_w_left is not None and demo_T_w_right is not None:
+                    src_demo = getattr(self.graph, f'{src_key}_demo')[edge_index[0]].long()
+                    if src_arm == 'left':
+                        T_w_src = demo_T_w_left[src_batch, src_demo, src_time]
+                        T_w_dst = demo_T_w_right[src_batch, src_demo, dst_time]
+                    else:
+                        T_w_src = demo_T_w_right[src_batch, src_demo, src_time]
+                        T_w_dst = demo_T_w_left[src_batch, src_demo, dst_time]
+                    T_src_from_dst = torch.bmm(torch.inverse(T_w_src), T_w_dst)
+                elif T_demo is None:
                     T_src_from_dst = T_curr[src_batch]
                 else:
                     src_demo = getattr(self.graph, f'{src_key}_demo')[edge_index[0]].long()
                     T_src_from_dst = T_demo[src_batch, src_demo, src_time]
             
-            base_attr = _build_cross_attr(edge_index, src_key, f'gripper_{dst_arm}', T_src_from_dst)
+            base_attr = _build_cross_attr(edge_index, src_key, dst_key, T_src_from_dst)
             
             if 'action' in edge_type:
                 learned = self.cross_action_edge_embd(torch.zeros(num_edges, device=self.device).long())

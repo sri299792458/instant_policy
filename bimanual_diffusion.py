@@ -330,7 +330,9 @@ class BimanualGraphDiffusion(L.LightningModule):
         batch_size = noisy_actions.shape[0]
         
         # Get current gripper positions
-        current_gripper = self.model.get_transformed_node_pos(noisy_actions, arm)
+        current_gripper = self.model.get_transformed_node_pos(
+            noisy_actions, arm, transform=False
+        )
         
         # Compute predicted gripper positions
         pred_output = preds[..., 3:6] + current_gripper + \
