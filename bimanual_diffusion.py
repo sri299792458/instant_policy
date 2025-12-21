@@ -449,11 +449,11 @@ class BimanualGraphDiffusion(L.LightningModule):
         
         # Rotation: Use rigid transform from keypoint offsets
         # pred_rot gives us where keypoints should move
-        # We need to find the rotation that best achieves this
+        # Match diffusion update: add translation before rigid fit
         from ip.utils.common_utils import get_rigid_transforms
         
         current_kp = gripper_kp  # [B, P, G, 3]
-        target_kp = current_kp + pred_rot  # [B, P, G, 3]
+        target_kp = current_kp + pred_rot + translation[:, :, None, :]  # [B, P, G, 3]
         
         # Get rigid transform that maps current_kp -> target_kp
         T_delta = get_rigid_transforms(
