@@ -198,10 +198,19 @@ class BimanualGraphDiffusion(L.LightningModule):
         loss = (loss_left + loss_right) / 2
         
         # Optional coordination consistency loss
+        # CRITICAL: Must compute on MODEL PREDICTIONS, not noisy inputs!
         if self.config.get('use_coordination_loss', False):
-            # Use GT actions, not the overwritten noisy ones!
+            # Decode predictions from delta format to SE(3) actions
+            pred_actions_left = self._decode_predictions_to_actions(
+                preds_left, noisy_actions_left, 'left'
+            )
+            pred_actions_right = self._decode_predictions_to_actions(
+                preds_right, noisy_actions_right, 'right'
+            )
+            
+            # Now compute coordination loss on predictions vs ground truth
             coord_loss = self._compute_coordination_loss(
-                noisy_actions_left, noisy_actions_right,
+                pred_actions_left, pred_actions_right,
                 gt_actions_left, gt_actions_right
             )
             coord_weight = self.config.get('coordination_loss_weight', 0.1)
@@ -401,6 +410,63 @@ class BimanualGraphDiffusion(L.LightningModule):
         rot_loss = torch.norm(rot_diff.reshape(B, P, 9), dim=-1).mean()
         
         return trans_loss + rot_loss
+    
+    def _decode_predictions_to_actions(self, preds: torch.Tensor, 
+                                       noisy_actions: torch.Tensor,
+                                       arm: str) -> torch.Tensor:
+        """
+        Decode model predictions from delta format back to SE(3) actions.
+        
+        The model predicts deltas/flows relative to gripper keypoints.
+        This reverses get_labels() to reconstruct predicted actions.
+        
+        Args:
+            preds: [B, P, G, 7] model predictions (trans delta, rot delta, grip)
+            noisy_actions: [B, P, 4, 4] noisy input actions
+            arm: 'left' or 'right'
+            
+        Returns:
+            pred_actions: [B, P, 4, 4] reconstructed SE(3) actions
+        """
+        B, P, G = preds.shape[:3]
+        
+        # Get gripper keypoints
+        gripper_kp = self.model.graph.gripper_keypoints[None, None, :, :].repeat(B, P, 1, 1)  # [B, P, G, 3]
+        
+        # Denormalize predictions (they were normalized during training)
+        preds_denorm = preds.clone()
+        normalizer = self.normalizer_left if arm == 'left' else self.normalizer_right
+        preds_denorm[..., :6] = normalizer.denormalize_labels(preds_denorm[..., :6])
+        
+        # Extract components
+        pred_trans = preds_denorm[..., :3]      # [B, P, G, 3]
+        pred_rot = preds_denorm[..., 3:6]       # [B, P, G, 3]
+        
+        # Translation: average translation across keypoints
+        translation = pred_trans.mean(dim=-2)    # [B, P, 3]
+        
+        # Rotation: Use rigid transform from keypoint offsets
+        # pred_rot gives us where keypoints should move
+        # We need to find the rotation that best achieves this
+        from ip.utils.common_utils import get_rigid_transforms
+        
+        current_kp = gripper_kp  # [B, P, G, 3]
+        target_kp = current_kp + pred_rot  # [B, P, G, 3]
+        
+        # Get rigid transform that maps current_kp -> target_kp
+        T_delta = get_rigid_transforms(
+            current_kp.reshape(-1, G, 3),
+            target_kp.reshape(-1, G, 3)
+        ).reshape(B, P, 4, 4)
+        
+        # Combine: The predicted action is noisy_action composed with delta
+        # pred_action = noisy_action @ T_delta
+        pred_actions = torch.bmm(
+            noisy_actions.reshape(-1, 4, 4),
+            T_delta.reshape(-1, 4, 4)
+        ).reshape(B, P, 4, 4)
+        
+        return pred_actions
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
