@@ -867,6 +867,15 @@ class BimanualGraphRep(nn.Module):
             return
         if T_left_to_right.dim() == 2:
             T_left_to_right = T_left_to_right.unsqueeze(0)
+
+        def _inv_safe(mat):
+            if mat is None:
+                return None
+            if not mat.is_floating_point():
+                return torch.inverse(mat)
+            if mat.dtype in (torch.float16, torch.bfloat16):
+                return torch.inverse(mat.float()).to(mat.dtype)
+            return torch.inverse(mat)
         
         # Demo transforms (per-timestep, per-demo)
         demo_T_left_to_right = getattr(data, 'demo_T_left_to_right', None)
@@ -876,7 +885,7 @@ class BimanualGraphRep(nn.Module):
             demo_T_left = demo_T_w_left
             demo_T_right = demo_T_w_right
             if demo_T_left is not None and demo_T_right is not None:
-                demo_T_left_to_right = torch.matmul(torch.inverse(demo_T_left), demo_T_right)
+                demo_T_left_to_right = torch.matmul(_inv_safe(demo_T_left), demo_T_right)
         if demo_T_left_to_right is not None:
             if demo_T_left_to_right.dim() == 3:
                 demo_T_left_to_right = demo_T_left_to_right.unsqueeze(0).unsqueeze(1)
@@ -904,7 +913,7 @@ class BimanualGraphRep(nn.Module):
         if actions_left is not None and actions_right is not None:
             B, P = actions_left.shape[:2]
             T_lr_curr = T_left_to_right[:, None, :, :].expand(B, P, 4, 4).reshape(-1, 4, 4)
-            A_left_inv = torch.inverse(actions_left.reshape(-1, 4, 4))
+            A_left_inv = _inv_safe(actions_left.reshape(-1, 4, 4))
             A_right = actions_right.reshape(-1, 4, 4)
             action_T_left_to_right = torch.bmm(
                 A_left_inv, torch.bmm(T_lr_curr, A_right)
@@ -967,7 +976,7 @@ class BimanualGraphRep(nn.Module):
                     else:
                         T_w_src = demo_T_w_right[src_batch, src_demo, src_time]
                         T_w_dst = demo_T_w_left[src_batch, src_demo, dst_time]
-                    T_src_from_dst = torch.bmm(torch.inverse(T_w_src), T_w_dst)
+                    T_src_from_dst = torch.bmm(_inv_safe(T_w_src), T_w_dst)
                 elif T_demo is None:
                     T_src_from_dst = T_curr[src_batch]
                 else:
@@ -983,9 +992,9 @@ class BimanualGraphRep(nn.Module):
             
             self.graph[edge_key].edge_attr = base_attr + learned
         
-        T_right_to_left = torch.inverse(T_left_to_right)
-        action_T_right_to_left = torch.inverse(action_T_left_to_right) if action_T_left_to_right is not None else None
-        demo_T_right_to_left = torch.inverse(demo_T_left_to_right) if demo_T_left_to_right is not None else None
+        T_right_to_left = _inv_safe(T_left_to_right)
+        action_T_right_to_left = _inv_safe(action_T_left_to_right)
+        demo_T_right_to_left = _inv_safe(demo_T_left_to_right)
         
         # Left -> Right edges
         _edge_attrs_for_direction('left', 'right', 'cross',

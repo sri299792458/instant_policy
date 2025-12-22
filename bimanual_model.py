@@ -87,7 +87,15 @@ class BimanualAGI(nn.Module):
         # NOTE: Cross edges removed from local stage - they appear in cond/action after gating
         local_edges = [
             ('gripper_left', 'rel', 'gripper_left'),
-           ('gripper_right', 'rel', 'gripper_right'),
+            ('gripper_right', 'rel', 'gripper_right'),
+            ('scene_left', 'rel_demo', 'scene_left'),
+            ('scene_right', 'rel_demo', 'scene_right'),
+            ('scene_left', 'rel_demo', 'gripper_left'),
+            ('scene_right', 'rel_demo', 'gripper_right'),
+            ('scene_left', 'rel_action', 'scene_left'),
+            ('scene_right', 'rel_action', 'scene_right'),
+            ('scene_left', 'rel_action', 'gripper_left'),
+            ('scene_right', 'rel_action', 'gripper_right'),
         ]
         
         # Context edges: Demo temporal and demo-to-current
@@ -128,7 +136,10 @@ class BimanualAGI(nn.Module):
 
         # Helper to filter metadata for specific edges
         def filter_metadata(edges):
-            return (self.graph.node_types, [e for e in self.graph.edge_types if e in edges])
+            edge_subset = [e for e in self.graph.edge_types if e in edges]
+            node_types_set = {src for src, _, _ in edge_subset} | {dst for _, _, dst in edge_subset}
+            node_types = [n for n in self.graph.node_types if n in node_types_set]
+            return (node_types, edge_subset)
 
         self.local_encoder = GraphTransformer(
             in_channels=in_channels,
@@ -358,6 +369,9 @@ class BimanualAGI(nn.Module):
             self.graph.graph.edge_index_dict,
             self.graph.graph.edge_attr_dict
         )
+        for node_type, feats in self.graph.graph.x_dict.items():
+            if node_type not in x_dict:
+                x_dict[node_type] = feats
         
         # ============== Apply Coordination Gating ==============
         # Compute how much the arms should attend to each other

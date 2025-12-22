@@ -35,6 +35,10 @@ def parse_args():
                         help='Whether to save checkpoints')
     parser.add_argument('--use_wandb', type=int, default=0,
                         help='Whether to use wandb logging')
+    parser.add_argument('--save_root', type=str, default='./checkpoints',
+                        help='Root directory for checkpoints/logs')
+    parser.add_argument('--wandb_dir', type=str, default=None,
+                        help='Directory for Weights & Biases logs')
     
     # Model configuration
     parser.add_argument('--fine_tune', type=int, default=0,
@@ -119,7 +123,7 @@ def main():
     
     # Create save directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_dir = f'./checkpoints/{args.run_name}_{timestamp}'
+    save_dir = os.path.join(args.save_root, f'{args.run_name}_{timestamp}')
     if args.record:
         os.makedirs(save_dir, exist_ok=True)
     config['save_dir'] = save_dir
@@ -157,10 +161,13 @@ def main():
     # Setup logging
     logger = None
     if args.use_wandb:
+        if args.wandb_dir:
+            os.makedirs(args.wandb_dir, exist_ok=True)
         logger = WandbLogger(
             project='bimanual_instant_policy',
             name=args.run_name,
-            config=config
+            config=config,
+            save_dir=args.wandb_dir,
         )
     
     # Callbacks

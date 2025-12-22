@@ -672,7 +672,7 @@ def check_edge_attributes(graph_rep: BimanualGraphRep,
         expected = compute_rel_attr(
             graph_rep, grip_key, grip_key,
             graph_rep.graph[edge_key].edge_index,
-            all_T_w_e, all_T_e_w
+            {}, {}
         )
         assert_allclose(graph_rep.graph[edge_key].edge_attr, expected,
                         f"{edge_key} edge_attr")
@@ -955,11 +955,11 @@ def check_collate() -> None:
         d = BimanualGraphData()
         T = 2
         N = 3
-        d.demo_T_w_left = torch.eye(4).reshape(1, T, 4, 4)
-        d.demo_T_w_right = torch.eye(4).reshape(1, T, 4, 4)
+        d.demo_T_w_left = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, T, 1, 1)
+        d.demo_T_w_right = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, T, 1, 1)
         d.demo_grips_left = torch.zeros(1, T)
         d.demo_grips_right = torch.zeros(1, T)
-        d.demo_T_left_to_right = torch.eye(4).reshape(1, T, 4, 4)
+        d.demo_T_left_to_right = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, T, 1, 1)
         d.pos_demos_left = torch.ones(T, N, 3) * offset
         d.pos_demos_right = torch.ones(T, N, 3) * (offset + 1.0)
         d.pos_obs_left = torch.ones(N, 3) * (offset + 2.0)
