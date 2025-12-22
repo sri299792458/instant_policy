@@ -10,14 +10,15 @@ import sys
 import time
 import torch
 import lightning as L
-from lightning.pytorch.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-    DeviceStatsMonitor,
-    EarlyStopping,
-    TerminateOnNaN,
-    ModelSummary,
-)
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
+try:
+    from lightning.pytorch.callbacks import DeviceStatsMonitor
+except ImportError:
+    DeviceStatsMonitor = None
+try:
+    from lightning.pytorch.callbacks import ModelSummary
+except ImportError:
+    ModelSummary = None
 from lightning.pytorch.loggers import WandbLogger, CSVLogger
 from torch.utils.data import DataLoader
 from datetime import datetime
@@ -98,6 +99,10 @@ def parse_args():
     # Device configuration
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda/cpu)')
+    parser.add_argument('--num_demos', type=int, default=None,
+                        help='Number of demos per sample (overrides config)')
+    parser.add_argument('--num_demos_test', type=int, default=None,
+                        help='Number of demos for validation (overrides config)')
     
     return parser.parse_args()
 
@@ -182,6 +187,10 @@ def main():
     config['device'] = args.device
     config['record'] = args.record == 1
     config['grad_norm_log_every'] = args.grad_norm_log_every
+    if args.num_demos is not None:
+        config['num_demos'] = args.num_demos
+    if args.num_demos_test is not None:
+        config['num_demos_test'] = args.num_demos_test
     
     # Create save directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -242,10 +251,10 @@ def main():
     # Callbacks
     callbacks = [
         LearningRateMonitor(logging_interval='step'),
-        TerminateOnNaN(),
-        ModelSummary(max_depth=2),
     ]
-    if 'cuda' in args.device:
+    if ModelSummary is not None:
+        callbacks.append(ModelSummary(max_depth=2))
+    if DeviceStatsMonitor is not None and 'cuda' in args.device:
         callbacks.append(DeviceStatsMonitor())
     callbacks.append(ThroughputCallback(log_every_n_steps=args.throughput_log_every))
 

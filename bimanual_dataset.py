@@ -44,7 +44,7 @@ def _build_generator(config: Dict):
 def _trajectory_to_graph_data(trajectory: BimanualTrajectory,
                               traj_horizon: int,
                               pred_horizon: int) -> BimanualGraphData:
-    """Convert a trajectory to graph data for training."""
+    """Convert a single trajectory to graph data for training."""
     T = len(trajectory)
 
     # Sample observation index
@@ -129,6 +129,122 @@ def _trajectory_to_graph_data(trajectory: BimanualTrajectory,
         action_T_right.append(T_rel_right)
         action_grips_left.append(trajectory.grips_left[future_idx])
         action_grips_right.append(trajectory.grips_right[future_idx])
+
+    graph_data.actions_left = torch.tensor(
+        np.stack(action_T_left, axis=0), dtype=torch.float32
+    )
+    graph_data.actions_right = torch.tensor(
+        np.stack(action_T_right, axis=0), dtype=torch.float32
+    )
+    graph_data.actions_grip_left = torch.tensor(
+        np.array(action_grips_left), dtype=torch.float32
+    )
+    graph_data.actions_grip_right = torch.tensor(
+        np.array(action_grips_right), dtype=torch.float32
+    )
+
+    return graph_data
+
+
+def _multi_demo_graph_data(demo_trajectories: List[BimanualTrajectory],
+                           live_trajectory: BimanualTrajectory,
+                           traj_horizon: int,
+                           pred_horizon: int) -> BimanualGraphData:
+    """Convert multiple demo trajectories plus a live trajectory to graph data."""
+    demo_T_left_all = []
+    demo_T_right_all = []
+    demo_grips_left_all = []
+    demo_grips_right_all = []
+    demo_T_left_to_right_all = []
+    demo_pcds_left_all = []
+    demo_pcds_right_all = []
+
+    for traj in demo_trajectories:
+        T = len(traj)
+        demo_indices = np.linspace(0, T - 1, traj_horizon).astype(int)
+        demo_T_left = traj.T_w_left[demo_indices]
+        demo_T_right = traj.T_w_right[demo_indices]
+        demo_grips_left = traj.grips_left[demo_indices]
+        demo_grips_right = traj.grips_right[demo_indices]
+        demo_T_left_to_right = np.stack([
+            np.linalg.inv(demo_T_left[i]) @ demo_T_right[i]
+            for i in range(len(demo_indices))
+        ], axis=0)
+
+        demo_pcds = [traj.pcds[i] for i in demo_indices]
+        demo_pcds_left = [transform_pcd(p, np.linalg.inv(demo_T_left[i]))
+                         for i, p in enumerate(demo_pcds)]
+        demo_pcds_right = [transform_pcd(p, np.linalg.inv(demo_T_right[i]))
+                          for i, p in enumerate(demo_pcds)]
+
+        demo_T_left_all.append(demo_T_left)
+        demo_T_right_all.append(demo_T_right)
+        demo_grips_left_all.append(demo_grips_left)
+        demo_grips_right_all.append(demo_grips_right)
+        demo_T_left_to_right_all.append(demo_T_left_to_right)
+        demo_pcds_left_all.append(demo_pcds_left)
+        demo_pcds_right_all.append(demo_pcds_right)
+
+    graph_data = BimanualGraphData()
+    graph_data.demo_T_w_left = torch.tensor(
+        np.stack(demo_T_left_all, axis=0), dtype=torch.float32
+    )
+    graph_data.demo_T_w_right = torch.tensor(
+        np.stack(demo_T_right_all, axis=0), dtype=torch.float32
+    )
+    graph_data.demo_grips_left = torch.tensor(
+        np.stack(demo_grips_left_all, axis=0), dtype=torch.float32
+    )
+    graph_data.demo_grips_right = torch.tensor(
+        np.stack(demo_grips_right_all, axis=0), dtype=torch.float32
+    )
+    graph_data.demo_T_left_to_right = torch.tensor(
+        np.stack(demo_T_left_to_right_all, axis=0), dtype=torch.float32
+    )
+    graph_data.pos_demos_left = torch.tensor(
+        np.stack(demo_pcds_left_all, axis=0), dtype=torch.float32
+    )
+    graph_data.pos_demos_right = torch.tensor(
+        np.stack(demo_pcds_right_all, axis=0), dtype=torch.float32
+    )
+
+    # Live observation and actions
+    T = len(live_trajectory)
+    obs_idx = np.random.randint(traj_horizon, T - pred_horizon - 1)
+    obs_T_left = live_trajectory.T_w_left[obs_idx]
+    obs_T_right = live_trajectory.T_w_right[obs_idx]
+    graph_data.T_obs_left = torch.tensor(obs_T_left, dtype=torch.float32)
+    graph_data.T_obs_right = torch.tensor(obs_T_right, dtype=torch.float32)
+    graph_data.current_grip_left = torch.tensor(
+        live_trajectory.grips_left[obs_idx], dtype=torch.float32
+    )
+    graph_data.current_grip_right = torch.tensor(
+        live_trajectory.grips_right[obs_idx], dtype=torch.float32
+    )
+
+    T_left_to_right = np.linalg.inv(obs_T_left) @ obs_T_right
+    graph_data.current_T_left_to_right = torch.tensor(T_left_to_right, dtype=torch.float32)
+
+    obs_pcd = live_trajectory.pcds[obs_idx]
+    graph_data.pos_obs_left = torch.tensor(
+        transform_pcd(obs_pcd, np.linalg.inv(obs_T_left)), dtype=torch.float32
+    )
+    graph_data.pos_obs_right = torch.tensor(
+        transform_pcd(obs_pcd, np.linalg.inv(obs_T_right)), dtype=torch.float32
+    )
+
+    action_T_left = []
+    action_T_right = []
+    action_grips_left = []
+    action_grips_right = []
+    for p in range(pred_horizon):
+        future_idx = min(obs_idx + p + 1, T - 1)
+        T_rel_left = relative_transform(obs_T_left, live_trajectory.T_w_left[future_idx])
+        T_rel_right = relative_transform(obs_T_right, live_trajectory.T_w_right[future_idx])
+        action_T_left.append(T_rel_left)
+        action_T_right.append(T_rel_right)
+        action_grips_left.append(live_trajectory.grips_left[future_idx])
+        action_grips_right.append(live_trajectory.grips_right[future_idx])
 
     graph_data.actions_left = torch.tensor(
         np.stack(action_T_left, axis=0), dtype=torch.float32
@@ -354,8 +470,13 @@ class BimanualRunningDataset(Dataset):
         """Fill buffer with generated samples."""
         while len(self.buffer) < self.buffer_size:
             try:
-                trajectory = self.generator.generate()
-                self.buffer.append(trajectory)
+                if self.num_demos > 1:
+                    demo_trajs = [self.generator.generate() for _ in range(self.num_demos)]
+                    live_traj = self.generator.generate()
+                    self.buffer.append((demo_trajs, live_traj))
+                else:
+                    trajectory = self.generator.generate()
+                    self.buffer.append(trajectory)
             except Exception as e:
                 print(f"Warning: Failed to generate sample: {e}")
                 continue
@@ -372,13 +493,24 @@ class BimanualRunningDataset(Dataset):
         # Occasionally regenerate
         if np.random.random() < 0.1:
             try:
-                new_traj = self.generator.generate()
-                self.buffer[buffer_idx] = new_traj
-                trajectory = new_traj
+                if self.num_demos > 1:
+                    demo_trajs = [self.generator.generate() for _ in range(self.num_demos)]
+                    live_traj = self.generator.generate()
+                    self.buffer[buffer_idx] = (demo_trajs, live_traj)
+                    trajectory = self.buffer[buffer_idx]
+                else:
+                    new_traj = self.generator.generate()
+                    self.buffer[buffer_idx] = new_traj
+                    trajectory = new_traj
             except Exception:
                 pass
         
         # Convert trajectory to graph data
+        if self.num_demos > 1:
+            demo_trajs, live_traj = trajectory
+            return _multi_demo_graph_data(
+                demo_trajs, live_traj, self.traj_horizon, self.pred_horizon
+            )
         return _trajectory_to_graph_data(trajectory, self.traj_horizon, self.pred_horizon)
 
 
@@ -416,6 +548,12 @@ class BimanualOnlineDataset(Dataset):
         self._ensure_generator()
         while True:
             try:
+                if self.num_demos > 1:
+                    demo_trajs = [self.generator.generate() for _ in range(self.num_demos)]
+                    live_traj = self.generator.generate()
+                    return _multi_demo_graph_data(
+                        demo_trajs, live_traj, self.traj_horizon, self.pred_horizon
+                    )
                 trajectory = self.generator.generate()
                 return _trajectory_to_graph_data(
                     trajectory, self.traj_horizon, self.pred_horizon
@@ -447,12 +585,15 @@ def collate_bimanual(batch: List[BimanualGraphData]) -> BimanualGraphData:
     for key in sample.keys():
         values = [getattr(b, key) for b in batch]
         if isinstance(values[0], torch.Tensor):
-            if key in demo_keys:
-                # Stack on batch dimension, concatenate demos
-                # Each sample has [1, T, ...] or [1, T], combine to [B, 1, T, ...]
-                setattr(result, key, torch.stack(values, dim=0).squeeze(1).unsqueeze(1))
-            else:
-                setattr(result, key, torch.stack(values, dim=0))
+        if key in demo_keys:
+            stacked = torch.stack(values, dim=0)
+            if stacked.dim() == 2:
+                stacked = stacked.unsqueeze(1)
+            elif stacked.dim() == 4 and stacked.shape[-2:] == (4, 4):
+                stacked = stacked.unsqueeze(1)
+            setattr(result, key, stacked)
+        else:
+            setattr(result, key, torch.stack(values, dim=0))
     
     # Flatten demo point clouds and add batch indices
     for arm in ['left', 'right']:
