@@ -215,13 +215,26 @@ class BimanualGraphDiffusion(L.LightningModule):
             )
             coord_weight = self.config.get('coordination_loss_weight', 0.1)
             loss = loss + coord_weight * coord_loss
-            self.log("Train_Coord_Loss", coord_loss, on_step=False, on_epoch=True)
+            self.log("Train_Coord_Loss", coord_loss, on_step=True, on_epoch=True)
         
-        self.log("Train_Loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("Train_Loss_Left", loss_left, on_step=False, on_epoch=True)
-        self.log("Train_Loss_Right", loss_right, on_step=False, on_epoch=True)
+        self.log("Train_Loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("Train_Loss_Left", loss_left, on_step=True, on_epoch=True)
+        self.log("Train_Loss_Right", loss_right, on_step=True, on_epoch=True)
         
         return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        log_every = self.config.get('grad_norm_log_every', 100)
+        if self.global_step % log_every != 0:
+            return
+        total_norm_sq = torch.zeros(1, device=self.device)
+        for param in self.parameters():
+            if param.grad is None:
+                continue
+            param_norm = param.grad.data.norm(2)
+            total_norm_sq += param_norm ** 2
+        total_norm = total_norm_sq.sqrt()
+        self.log("Train_Grad_Norm", total_norm, on_step=True, on_epoch=False)
     
     def validation_step(self, data, batch_idx, vis=False, ret_actions=False):
         batch_size = data.actions_left.shape[0]
@@ -254,6 +267,7 @@ class BimanualGraphDiffusion(L.LightningModule):
         
         mean_trans_err = (trans_err_left + trans_err_right) / 2
         self.val_losses.append(mean_trans_err)
+        self.log("Val_Trans_Mean", mean_trans_err, on_step=False, on_epoch=True)
         
         self.model.reinit_graphs(self.config['batch_size'], num_demos=self.config['num_demos'])
         

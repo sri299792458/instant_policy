@@ -380,18 +380,39 @@ class BimanualAGI(nn.Module):
             curr_time = self.traj_horizon
             left_curr_mask = self.graph.graph.gripper_left_time == curr_time
             right_curr_mask = self.graph.graph.gripper_right_time == curr_time
-            
-            left_pooled = x_dict['gripper_left'][left_curr_mask].mean(dim=0)  # [hidden_dim]
-            right_pooled = x_dict['gripper_right'][right_curr_mask].mean(dim=0)
-            
-            combined = torch.cat([left_pooled, right_pooled], dim=-1)  # [2*hidden_dim]
-            coord_gate = self.coordination_gate(combined)  # [1]
-            
-            # Scale cross-arm edge attributes by gate
+
+            left_x = x_dict['gripper_left'][left_curr_mask]
+            right_x = x_dict['gripper_right'][right_curr_mask]
+            left_batch = getattr(self.graph.graph, 'gripper_left_batch')[left_curr_mask]
+            right_batch = getattr(self.graph.graph, 'gripper_right_batch')[right_curr_mask]
+
+            B = self.batch_size
+            H = left_x.shape[-1]
+            left_sum = left_x.new_zeros(B, H)
+            right_sum = right_x.new_zeros(B, H)
+            left_cnt = left_x.new_zeros(B, 1)
+            right_cnt = right_x.new_zeros(B, 1)
+
+            left_sum.index_add_(0, left_batch, left_x)
+            right_sum.index_add_(0, right_batch, right_x)
+            left_cnt.index_add_(0, left_batch, left_x.new_ones(left_x.size(0), 1))
+            right_cnt.index_add_(0, right_batch, right_x.new_ones(right_x.size(0), 1))
+
+            left_pooled = left_sum / left_cnt.clamp_min(1)
+            right_pooled = right_sum / right_cnt.clamp_min(1)
+
+            combined = torch.cat([left_pooled, right_pooled], dim=-1)  # [B, 2*hidden_dim]
+            coord_gate = self.coordination_gate(combined)  # [B, 1]
+
+            # Scale cross-arm edge attributes by per-sample gate
             for edge_type in self.graph.graph.edge_attr_dict.keys():
                 if 'cross' in edge_type[1]:  # cross, cross_demo, cross_action edges
-                    self.graph.graph.edge_attr_dict[edge_type] = \
-                        self.graph.graph.edge_attr_dict[edge_type] * coord_gate
+                    edge_idx = self.graph.graph[edge_type].edge_index
+                    src_key = edge_type[0]
+                    src_batch = getattr(self.graph.graph, f'{src_key}_batch')[edge_idx[0]]
+                    self.graph.graph.edge_attr_dict[edge_type] = (
+                        self.graph.graph.edge_attr_dict[edge_type] * coord_gate[src_batch]
+                    )
         
         # 2. Context Propagation
         # Propagates information from demos to current context

@@ -7,10 +7,18 @@ or real demonstration data.
 import argparse
 import os
 import sys
+import time
 import torch
 import lightning as L
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    DeviceStatsMonitor,
+    EarlyStopping,
+    TerminateOnNaN,
+    ModelSummary,
+)
+from lightning.pytorch.loggers import WandbLogger, CSVLogger
 from torch.utils.data import DataLoader
 from datetime import datetime
 
@@ -22,7 +30,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ip.configs.bimanual_config import get_config
 from bimanual_diffusion import BimanualGraphDiffusion
-from bimanual_dataset import BimanualDataset, BimanualRunningDataset, collate_bimanual
+from bimanual_dataset import (
+    BimanualDataset,
+    BimanualRunningDataset,
+    BimanualOnlineDataset,
+    collate_bimanual
+)
 
 
 def parse_args():
@@ -53,6 +66,8 @@ def parse_args():
                         help='Path to validation data')
     parser.add_argument('--use_pseudo_demos', type=int, default=1,
                         help='Use pseudo-demo generation')
+    parser.add_argument('--online_pseudo_demos', type=int, default=1,
+                        help='Use continuous online pseudo-demo generation')
     
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -61,6 +76,22 @@ def parse_args():
                         help='Number of data loader workers')
     parser.add_argument('--max_epochs', type=int, default=1000,
                         help='Maximum training epochs')
+    parser.add_argument('--max_steps', type=int, default=None,
+                        help='Maximum training steps (overrides max_epochs)')
+    parser.add_argument('--val_check_interval', type=int, default=5000,
+                        help='Run validation every N training steps')
+    parser.add_argument('--log_every_n_steps', type=int, default=100,
+                        help='Logging frequency in steps')
+    parser.add_argument('--save_every_steps', type=int, default=50000,
+                        help='Save periodic checkpoints every N steps')
+    parser.add_argument('--save_top_k', type=int, default=3,
+                        help='Number of best checkpoints to keep')
+    parser.add_argument('--early_stop_patience', type=int, default=0,
+                        help='Early stop after N validation checks without improvement (0=off)')
+    parser.add_argument('--grad_norm_log_every', type=int, default=100,
+                        help='Log gradient norm every N steps')
+    parser.add_argument('--throughput_log_every', type=int, default=50,
+                        help='Log throughput every N steps')
     parser.add_argument('--lr', type=float, default=1e-5,
                         help='Learning rate')
     
@@ -76,7 +107,10 @@ def create_dataloaders(args, config):
     
     if args.use_pseudo_demos or args.data_path_train is None:
         print("Using pseudo-demonstration generation for training")
-        train_dataset = BimanualRunningDataset(config, buffer_size=1000)
+        if args.online_pseudo_demos:
+            train_dataset = BimanualOnlineDataset(config)
+        else:
+            train_dataset = BimanualRunningDataset(config, buffer_size=1000)
         val_dataset = BimanualRunningDataset(config, buffer_size=100)
     else:
         print(f"Loading training data from {args.data_path_train}")
@@ -109,6 +143,33 @@ def create_dataloaders(args, config):
     return train_loader, val_loader
 
 
+class ThroughputCallback(L.Callback):
+    """Log batch time and throughput."""
+
+    def __init__(self, log_every_n_steps: int = 50):
+        super().__init__()
+        self.log_every_n_steps = log_every_n_steps
+        self._start_time = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self._start_time = time.perf_counter()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self._start_time is None:
+            return
+        if self.log_every_n_steps and (trainer.global_step % self.log_every_n_steps != 0):
+            return
+        batch_time = time.perf_counter() - self._start_time
+        if hasattr(batch, 'actions_left'):
+            batch_size = batch.actions_left.shape[0]
+        else:
+            batch_size = trainer.datamodule.batch_size if trainer.datamodule else None
+        if batch_size:
+            pl_module.log("Train_Samples_Per_Sec", batch_size / max(batch_time, 1e-6),
+                          on_step=True, on_epoch=False)
+        pl_module.log("Train_Batch_Time_Sec", batch_time, on_step=True, on_epoch=False)
+
+
 def main():
     args = parse_args()
     
@@ -120,6 +181,7 @@ def main():
     config['lr'] = args.lr
     config['device'] = args.device
     config['record'] = args.record == 1
+    config['grad_norm_log_every'] = args.grad_norm_log_every
     
     # Create save directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -136,6 +198,8 @@ def main():
     print(f"Device: {args.device}")
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
+    if args.max_steps is not None:
+        print(f"Max steps: {args.max_steps}")
     print(f"{'='*60}\n")
     
     # Create model
@@ -159,30 +223,58 @@ def main():
     train_loader, val_loader = create_dataloaders(args, config)
     
     # Setup logging
-    logger = None
+    logger = []
     if args.use_wandb:
         if args.wandb_dir:
             os.makedirs(args.wandb_dir, exist_ok=True)
-        logger = WandbLogger(
+        logger.append(WandbLogger(
             project='bimanual_instant_policy',
             name=args.run_name,
             config=config,
             save_dir=args.wandb_dir,
-        )
+            log_model=False,
+        ))
+    if args.record:
+        logger.append(CSVLogger(save_dir, name='metrics'))
+    if not logger:
+        logger = None
     
     # Callbacks
     callbacks = [
         LearningRateMonitor(logging_interval='step'),
+        TerminateOnNaN(),
+        ModelSummary(max_depth=2),
     ]
-    
+    if 'cuda' in args.device:
+        callbacks.append(DeviceStatsMonitor())
+    callbacks.append(ThroughputCallback(log_every_n_steps=args.throughput_log_every))
+
     if args.record:
         callbacks.append(
             ModelCheckpoint(
                 dirpath=save_dir,
-                filename='best-{epoch:02d}-{Val_Trans_Left:.4f}',
+                filename='best-{step}-{Val_Trans_Left:.4f}',
                 monitor='Val_Trans_Left',
                 mode='min',
-                save_top_k=3,
+                save_top_k=args.save_top_k,
+                save_last=True,
+            )
+        )
+        if args.save_every_steps and args.save_every_steps > 0:
+            callbacks.append(
+                ModelCheckpoint(
+                    dirpath=save_dir,
+                    filename='step-{step}',
+                    every_n_train_steps=args.save_every_steps,
+                    save_top_k=-1,
+                )
+            )
+    if args.early_stop_patience and args.early_stop_patience > 0:
+        callbacks.append(
+            EarlyStopping(
+                monitor='Val_Trans_Left',
+                mode='min',
+                patience=args.early_stop_patience,
             )
         )
     
@@ -190,12 +282,13 @@ def main():
     trainer = L.Trainer(
         accelerator='gpu' if 'cuda' in args.device else 'cpu',
         devices=1,
-        max_epochs=args.max_epochs,
+        max_epochs=None if args.max_steps is not None else args.max_epochs,
+        max_steps=args.max_steps,
         logger=logger,
         callbacks=callbacks,
-        val_check_interval=5000,
+        val_check_interval=args.val_check_interval,
         check_val_every_n_epoch=None,
-        log_every_n_steps=100,
+        log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=1.0,
         precision='16-mixed' if 'cuda' in args.device else 32,
         enable_progress_bar=True,
