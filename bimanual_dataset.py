@@ -585,15 +585,15 @@ def collate_bimanual(batch: List[BimanualGraphData]) -> BimanualGraphData:
     for key in sample.keys():
         values = [getattr(b, key) for b in batch]
         if isinstance(values[0], torch.Tensor):
-        if key in demo_keys:
-            stacked = torch.stack(values, dim=0)
-            if stacked.dim() == 2:
-                stacked = stacked.unsqueeze(1)
-            elif stacked.dim() == 4 and stacked.shape[-2:] == (4, 4):
-                stacked = stacked.unsqueeze(1)
-            setattr(result, key, stacked)
-        else:
-            setattr(result, key, torch.stack(values, dim=0))
+            if key in demo_keys:
+                stacked = torch.stack(values, dim=0)
+                if stacked.dim() == 2:
+                    stacked = stacked.unsqueeze(1)
+                elif stacked.dim() == 4 and stacked.shape[-2:] == (4, 4):
+                    stacked = stacked.unsqueeze(1)
+                setattr(result, key, stacked)
+            else:
+                setattr(result, key, torch.stack(values, dim=0))
     
     # Flatten demo point clouds and add batch indices
     for arm in ['left', 'right']:
