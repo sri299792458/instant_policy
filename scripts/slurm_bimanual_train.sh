@@ -41,7 +41,7 @@ RUN_NAME="bimanual_ip_full"
 SAVE_ROOT="/scratch.global/kanth042/ip/checkpoints"
 WANDB_DIR="/scratch.global/kanth042/ip/wandb"
 
-python -u bimanual_train.py \
+python -u -m scripts.train \
   --run_name "${RUN_NAME}" \
   --use_pseudo_demos 1 \
   --online_pseudo_demos 1 \

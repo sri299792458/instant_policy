@@ -3,28 +3,34 @@ from setuptools import setup, find_packages
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = '0.0.0'
-PACKAGE_NAME = 'ip'
-AUTHOR = 'You'
+VERSION = '0.1.0'
+PACKAGE_NAME = 'bimanual_instant_policy'
+AUTHOR = 'Srinivas'
 AUTHOR_EMAIL = 'you@email.com'
-URL = 'https://github.com/you/your_package'
+URL = 'https://github.com/sri299792458/bimanual_instant_policy'
 
 LICENSE = 'MIT'
-DESCRIPTION = ''
-# LONG_DESCRIPTION = (HERE / "README.md").read_text()
-# LONG_DESC_TYPE = "text/markdown"
+DESCRIPTION = 'Bimanual Instant Policy for dual-arm manipulation'
 
-INSTALL_REQUIRES = []
+INSTALL_REQUIRES = [
+    'torch>=2.0',
+    'torch_geometric',
+    'lightning',
+    'numpy',
+    'scipy',
+    'diffusers',
+    'wandb',
+]
 
-setup(name=PACKAGE_NAME,
-      version=VERSION,
-      description=DESCRIPTION,
-      # long_description=LONG_DESCRIPTION,
-      # long_description_content_type=LONG_DESC_TYPE,
-      author=AUTHOR,
-      license=LICENSE,
-      author_email=AUTHOR_EMAIL,
-      url=URL,
-      install_requires=INSTALL_REQUIRES,
-      packages=find_packages()
-      )
+setup(
+    name=PACKAGE_NAME,
+    version=VERSION,
+    description=DESCRIPTION,
+    author=AUTHOR,
+    license=LICENSE,
+    author_email=AUTHOR_EMAIL,
+    url=URL,
+    install_requires=INSTALL_REQUIRES,
+    packages=find_packages(include=['src', 'src.*', 'external', 'external.*']),
+    python_requires='>=3.8',
+)

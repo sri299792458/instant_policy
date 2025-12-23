@@ -1,4 +1,6 @@
-RLBench/
+# External dependencies (submodules or cloned repos)
+external/RLBench/
+external/PyRep/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
