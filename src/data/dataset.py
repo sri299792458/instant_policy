@@ -64,8 +64,11 @@ def _trajectory_to_graph_data(trajectory: BimanualTrajectory,
 
     graph_data.demo_T_w_left = torch.tensor(demo_T_left, dtype=torch.float32).unsqueeze(0)  # [1, T, 4, 4] -> [B, D, T, 4, 4]
     graph_data.demo_T_w_right = torch.tensor(demo_T_right, dtype=torch.float32).unsqueeze(0)
-    graph_data.demo_grips_left = torch.tensor(demo_grips_left, dtype=torch.float32).unsqueeze(0)
-    graph_data.demo_grips_right = torch.tensor(demo_grips_right, dtype=torch.float32).unsqueeze(0)
+    # Normalize gripper states from [0,1] to [-1,1] to match original IP
+    graph_data.demo_grips_left = (torch.tensor(demo_grips_left, dtype=torch.float32) - 0.5) * 2
+    graph_data.demo_grips_left = graph_data.demo_grips_left.unsqueeze(0)
+    graph_data.demo_grips_right = (torch.tensor(demo_grips_right, dtype=torch.float32) - 0.5) * 2
+    graph_data.demo_grips_right = graph_data.demo_grips_right.unsqueeze(0)
     demo_T_left_to_right = np.stack([
         np.linalg.inv(demo_T_left[i]) @ demo_T_right[i]
         for i in range(len(demo_indices))
@@ -94,12 +97,13 @@ def _trajectory_to_graph_data(trajectory: BimanualTrajectory,
     obs_T_right = trajectory.T_w_right[obs_idx]
     graph_data.T_obs_left = torch.tensor(obs_T_left, dtype=torch.float32)
     graph_data.T_obs_right = torch.tensor(obs_T_right, dtype=torch.float32)
-    graph_data.current_grip_left = torch.tensor(
+    # Normalize current gripper states from [0,1] to [-1,1]
+    graph_data.current_grip_left = (torch.tensor(
         trajectory.grips_left[obs_idx], dtype=torch.float32
-    )
-    graph_data.current_grip_right = torch.tensor(
+    ) - 0.5) * 2
+    graph_data.current_grip_right = (torch.tensor(
         trajectory.grips_right[obs_idx], dtype=torch.float32
-    )
+    ) - 0.5) * 2
 
     # Relative transform from left to right arm
     T_left_to_right = np.linalg.inv(obs_T_left) @ obs_T_right
@@ -136,12 +140,13 @@ def _trajectory_to_graph_data(trajectory: BimanualTrajectory,
     graph_data.actions_right = torch.tensor(
         np.stack(action_T_right, axis=0), dtype=torch.float32
     )
-    graph_data.actions_grip_left = torch.tensor(
+    # Normalize action gripper states from [0,1] to [-1,1]
+    graph_data.actions_grip_left = (torch.tensor(
         np.array(action_grips_left), dtype=torch.float32
-    )
-    graph_data.actions_grip_right = torch.tensor(
+    ) - 0.5) * 2
+    graph_data.actions_grip_right = (torch.tensor(
         np.array(action_grips_right), dtype=torch.float32
-    )
+    ) - 0.5) * 2
 
     return graph_data
 
@@ -192,12 +197,13 @@ def _multi_demo_graph_data(demo_trajectories: List[BimanualTrajectory],
     graph_data.demo_T_w_right = torch.tensor(
         np.stack(demo_T_right_all, axis=0), dtype=torch.float32
     )
-    graph_data.demo_grips_left = torch.tensor(
+    # Normalize gripper states from [0,1] to [-1,1] to match original IP
+    graph_data.demo_grips_left = (torch.tensor(
         np.stack(demo_grips_left_all, axis=0), dtype=torch.float32
-    )
-    graph_data.demo_grips_right = torch.tensor(
+    ) - 0.5) * 2
+    graph_data.demo_grips_right = (torch.tensor(
         np.stack(demo_grips_right_all, axis=0), dtype=torch.float32
-    )
+    ) - 0.5) * 2
     graph_data.demo_T_left_to_right = torch.tensor(
         np.stack(demo_T_left_to_right_all, axis=0), dtype=torch.float32
     )
@@ -215,12 +221,13 @@ def _multi_demo_graph_data(demo_trajectories: List[BimanualTrajectory],
     obs_T_right = live_trajectory.T_w_right[obs_idx]
     graph_data.T_obs_left = torch.tensor(obs_T_left, dtype=torch.float32)
     graph_data.T_obs_right = torch.tensor(obs_T_right, dtype=torch.float32)
-    graph_data.current_grip_left = torch.tensor(
+    # Normalize current gripper states from [0,1] to [-1,1]
+    graph_data.current_grip_left = (torch.tensor(
         live_trajectory.grips_left[obs_idx], dtype=torch.float32
-    )
-    graph_data.current_grip_right = torch.tensor(
+    ) - 0.5) * 2
+    graph_data.current_grip_right = (torch.tensor(
         live_trajectory.grips_right[obs_idx], dtype=torch.float32
-    )
+    ) - 0.5) * 2
 
     T_left_to_right = np.linalg.inv(obs_T_left) @ obs_T_right
     graph_data.current_T_left_to_right = torch.tensor(T_left_to_right, dtype=torch.float32)
@@ -252,12 +259,13 @@ def _multi_demo_graph_data(demo_trajectories: List[BimanualTrajectory],
     graph_data.actions_right = torch.tensor(
         np.stack(action_T_right, axis=0), dtype=torch.float32
     )
-    graph_data.actions_grip_left = torch.tensor(
+    # Normalize action gripper states from [0,1] to [-1,1]
+    graph_data.actions_grip_left = (torch.tensor(
         np.array(action_grips_left), dtype=torch.float32
-    )
-    graph_data.actions_grip_right = torch.tensor(
+    ) - 0.5) * 2
+    graph_data.actions_grip_right = (torch.tensor(
         np.array(action_grips_right), dtype=torch.float32
-    )
+    ) - 0.5) * 2
 
     return graph_data
 
@@ -396,8 +404,11 @@ class BimanualDataset(Dataset):
         # Demo poses (with unsqueeze for demo dimension)
         graph_data.demo_T_w_left = torch.tensor(demo_T_left, dtype=torch.float32).unsqueeze(0)
         graph_data.demo_T_w_right = torch.tensor(demo_T_right, dtype=torch.float32).unsqueeze(0)
-        graph_data.demo_grips_left = torch.tensor(demo_grips_left, dtype=torch.float32).unsqueeze(0)
-        graph_data.demo_grips_right = torch.tensor(demo_grips_right, dtype=torch.float32).unsqueeze(0)
+        # Normalize gripper states from [0,1] to [-1,1] to match original IP
+        graph_data.demo_grips_left = (torch.tensor(demo_grips_left, dtype=torch.float32) - 0.5) * 2
+        graph_data.demo_grips_left = graph_data.demo_grips_left.unsqueeze(0)
+        graph_data.demo_grips_right = (torch.tensor(demo_grips_right, dtype=torch.float32) - 0.5) * 2
+        graph_data.demo_grips_right = graph_data.demo_grips_right.unsqueeze(0)
         graph_data.demo_T_left_to_right = torch.tensor(
             demo_T_left_to_right, dtype=torch.float32
         ).unsqueeze(0)
@@ -411,8 +422,9 @@ class BimanualDataset(Dataset):
         # Current observation
         graph_data.T_obs_left = torch.tensor(obs_T_left, dtype=torch.float32)
         graph_data.T_obs_right = torch.tensor(obs_T_right, dtype=torch.float32)
-        graph_data.current_grip_left = torch.tensor(obs_grip_left, dtype=torch.float32)
-        graph_data.current_grip_right = torch.tensor(obs_grip_right, dtype=torch.float32)
+        # Normalize current gripper states from [0,1] to [-1,1]
+        graph_data.current_grip_left = (torch.tensor(obs_grip_left, dtype=torch.float32) - 0.5) * 2
+        graph_data.current_grip_right = (torch.tensor(obs_grip_right, dtype=torch.float32) - 0.5) * 2
         
         # Relative transform from left to right arm
         T_left_to_right = np.linalg.inv(obs_T_left) @ obs_T_right
@@ -425,8 +437,9 @@ class BimanualDataset(Dataset):
         # Ground truth actions
         graph_data.actions_left = torch.tensor(action_T_left, dtype=torch.float32)
         graph_data.actions_right = torch.tensor(action_T_right, dtype=torch.float32)
-        graph_data.actions_grip_left = torch.tensor(action_grips_left, dtype=torch.float32)
-        graph_data.actions_grip_right = torch.tensor(action_grips_right, dtype=torch.float32)
+        # Normalize action gripper states from [0,1] to [-1,1]
+        graph_data.actions_grip_left = (torch.tensor(action_grips_left, dtype=torch.float32) - 0.5) * 2
+        graph_data.actions_grip_right = (torch.tensor(action_grips_right, dtype=torch.float32) - 0.5) * 2
         
         # Apply transforms if any
         if self.transform:
