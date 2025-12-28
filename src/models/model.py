@@ -180,16 +180,11 @@ class BimanualAGI(nn.Module):
             self.cond_encoder = torch.compile(self.cond_encoder, mode="reduce-overhead")
             self.action_encoder = torch.compile(self.action_encoder, mode="reduce-overhead")
         
-        # ============== Selective Coordination Gating ==============
-        # Learn when to coordinate: high gate = coordinated, low gate = independent
-        self.use_coordination_gate = config.get('use_coordination_gate', True)
-        if self.use_coordination_gate and self.graph.use_cross_arm:
-            self.coordination_gate = nn.Sequential(
-                nn.Linear(config['hidden_dim'] * 2, 256),
-                nn.GELU(),
-                nn.Linear(256, 1),
-                nn.Sigmoid()
-            ).to(config['device'])
+        # ============== Coordination Gating (Disabled) ==============
+        # Removed: The transformer's relation-aware attention naturally learns
+        # when to use cross-arm edges. With sparse same-timestep cross edges,
+        # a scalar gate is redundant and risks collapse to 0.
+        self.use_coordination_gate = False
         
         # ============== Prediction Heads (per arm) ==============
         # Left arm
@@ -377,46 +372,7 @@ class BimanualAGI(nn.Module):
             if node_type not in x_dict:
                 x_dict[node_type] = feats
         
-        # ============== Apply Coordination Gating ==============
-        # Compute how much the arms should attend to each other
-        if self.use_coordination_gate and self.graph.use_cross_arm:
-            # Pool current gripper features for both arms
-            curr_time = self.traj_horizon
-            left_curr_mask = self.graph.graph.gripper_left_time == curr_time
-            right_curr_mask = self.graph.graph.gripper_right_time == curr_time
-
-            left_x = x_dict['gripper_left'][left_curr_mask]
-            right_x = x_dict['gripper_right'][right_curr_mask]
-            left_batch = getattr(self.graph.graph, 'gripper_left_batch')[left_curr_mask]
-            right_batch = getattr(self.graph.graph, 'gripper_right_batch')[right_curr_mask]
-
-            B = self.batch_size
-            H = left_x.shape[-1]
-            left_sum = left_x.new_zeros(B, H)
-            right_sum = right_x.new_zeros(B, H)
-            left_cnt = left_x.new_zeros(B, 1)
-            right_cnt = right_x.new_zeros(B, 1)
-
-            left_sum.index_add_(0, left_batch, left_x)
-            right_sum.index_add_(0, right_batch, right_x)
-            left_cnt.index_add_(0, left_batch, left_x.new_ones(left_x.size(0), 1))
-            right_cnt.index_add_(0, right_batch, right_x.new_ones(right_x.size(0), 1))
-
-            left_pooled = left_sum / left_cnt.clamp_min(1)
-            right_pooled = right_sum / right_cnt.clamp_min(1)
-
-            combined = torch.cat([left_pooled, right_pooled], dim=-1)  # [B, 2*hidden_dim]
-            coord_gate = self.coordination_gate(combined)  # [B, 1]
-
-            # Scale cross-arm edge attributes by per-sample gate
-            for edge_type in self.graph.graph.edge_attr_dict.keys():
-                if 'cross' in edge_type[1]:  # cross, cross_demo, cross_action edges
-                    edge_idx = self.graph.graph[edge_type].edge_index
-                    src_key = edge_type[0]
-                    src_batch = getattr(self.graph.graph, f'{src_key}_batch')[edge_idx[0]]
-                    self.graph.graph.edge_attr_dict[edge_type] = (
-                        self.graph.graph.edge_attr_dict[edge_type] * coord_gate[src_batch]
-                    )
+        # Coordination gating removed - transformer attention naturally learns\n        # when to use cross-arm edges with sparse same-timestep connectivity
         
         # 2. Context Propagation
         # Propagates information from demos to current context
