@@ -480,16 +480,18 @@ class BimanualGraphRep(nn.Module):
         self.graph[('gripper_right', 'cross_action', 'gripper_left')].edge_index = dense_rl[:, cross_rl_act]
         
         # ==================== Demo Cross-Arm ====================
-        # Full temporal visibility for learning long-range coordination patterns
-        # CHANGED: Removed time window restriction to enable learning like
-        # "right arm position at t=0 determines where left should be at t=9"
+        # Same-timestep cross-arm edges only - rely on within-arm temporal
+        # edges to propagate information across time. This reduces edge count
+        # by ~10x while maintaining the same information flow capacity.
+        # Long-range coordination (e.g., handover) is learned through:
+        #   right[t=0] → ... → right[t=5] ↔ left[t=5] → ... → left[t=9]
         
         cross_lr_demo = (
             (g_left['batch'][dense_lr[0]] == g_right['batch'][dense_lr[1]]) &
             (g_left['time'][dense_lr[0]] < T) &
             (g_right['time'][dense_lr[1]] < T) &
-            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]])  # Same demo
-            # No time restriction - full trajectory visibility
+            (g_left['demo'][dense_lr[0]] == g_right['demo'][dense_lr[1]]) &  # Same demo
+            (g_left['time'][dense_lr[0]] == g_right['time'][dense_lr[1]])    # Same timestep
         )
         self.graph[('gripper_left', 'cross_demo', 'gripper_right')].edge_index = dense_lr[:, cross_lr_demo]
         
@@ -497,7 +499,8 @@ class BimanualGraphRep(nn.Module):
             (g_right['batch'][dense_rl[0]] == g_left['batch'][dense_rl[1]]) &
             (g_right['time'][dense_rl[0]] < T) &
             (g_left['time'][dense_rl[1]] < T) &
-            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]])
+            (g_right['demo'][dense_rl[0]] == g_left['demo'][dense_rl[1]]) &  # Same demo
+            (g_right['time'][dense_rl[0]] == g_left['time'][dense_rl[1]])    # Same timestep
         )
         self.graph[('gripper_right', 'cross_demo', 'gripper_left')].edge_index = dense_rl[:, cross_rl_demo]
     
