@@ -301,12 +301,13 @@ class BimanualAGI(nn.Module):
         
         actions_flat = actions.view(-1, 4, 4)  # [B*P, 4, 4]
         
-        # Transform: R^T @ (p - t)
-        current_obs = current_obs - actions_flat[:, :3, 3][:, None, :]
+        # Transform to match original IP: R^T @ p, then - t
+        # This expresses current observation in the future action frame
         current_obs = torch.bmm(
             actions_flat[:, :3, :3].transpose(1, 2),
             current_obs.permute(0, 2, 1)
         ).permute(0, 2, 1)
+        current_obs = current_obs - actions_flat[:, :3, 3][:, None, :]
         
         # Encode
         action_batch = torch.arange(
@@ -351,17 +352,11 @@ class BimanualAGI(nn.Module):
                 setattr(data, f'live_scene_embds_{arm}', embds)
                 setattr(data, f'live_scene_pos_{arm}', pos)
             
-            # CRITICAL FIX: Action scene embeddings should match reference impl:
-            # Replicate live scene embeddings for all prediction timesteps
-            # (Previously was calling get_action_scene_emb with caching which
-            # caused stale embeddings across diffusion iterations)
-            live_embds = getattr(data, f'live_scene_embds_{arm}')  # [B, S, D]
-            live_pos = getattr(data, f'live_scene_pos_{arm}')  # [B, S, 3]
-            
-            # Replicate for pred_horizon timesteps [B, P, S, D]
-            action_embds = live_embds[:, None, :, :].repeat(1, self.pred_horizon, 1, 1)
-            action_pos = live_pos[:, None, :, :].repeat(1, self.pred_horizon, 1, 1)
-            
+            # CRITICAL: Compute action scene embeddings FRESH each forward pass
+            # (no caching) to match original IP behavior. This transforms the
+            # current observation by each predicted action to create "imagined"
+            # future scene views for the diffusion model.
+            action_embds, action_pos = self.get_action_scene_emb(data, arm)
             setattr(data, f'action_scene_embds_{arm}', action_embds)
             setattr(data, f'action_scene_pos_{arm}', action_pos)
         
