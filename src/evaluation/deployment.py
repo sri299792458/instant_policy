@@ -46,8 +46,7 @@ class BimanualPolicy:
         self.config = get_config()
         self.config['device'] = device
         self.config['batch_size'] = 1
-        self.config['compile_model'] = False  # Disable compilation for inference (avoids graph cache issues)
-        self.config['compile_models'] = compile_model
+        self.config['compile_models'] = compile_model  # Use function param to control compilation
         
         print(f"Loading checkpoint from {checkpoint_path}")
         

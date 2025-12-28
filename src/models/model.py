@@ -174,11 +174,7 @@ class BimanualAGI(nn.Module):
             norm='layer'
         ).to(config['device'])
         
-        # Compile encoders only if explicitly requested (defaults to False for faster debugging)
-        if config.get('compile_model', False):
-            self.local_encoder = torch.compile(self.local_encoder, mode="reduce-overhead")
-            self.cond_encoder = torch.compile(self.cond_encoder, mode="reduce-overhead")
-            self.action_encoder = torch.compile(self.action_encoder, mode="reduce-overhead")
+        # Note: torch.compile is called via compile_models() below
         
         # ============== Coordination Gating (Disabled) ==============
         # Removed: The transformer's relation-aware attention naturally learns
@@ -215,8 +211,9 @@ class BimanualAGI(nn.Module):
             act='GELU', plain_last=True, norm='layer_norm'
         )
         
-        # Compile if requested
-        if config.get('compile_models', False):
+        # Compile models for faster training (enabled by default)
+        # Set compile_models=False in config for debugging
+        if config.get('compile_models', True):
             self.compile_models()
     
     def reinit_graphs(self, batch_size: int, num_demos: Optional[int] = None):
