@@ -4,18 +4,18 @@ Bimanual RLBench Evaluation Script.
 Evaluates a trained bimanual Instant Policy on PerAct2 RLBench bimanual tasks.
 
 Usage:
-    python -m src.evaluation.eval --task_name='lift_tray' --num_demos=2 --num_rollouts=10
+    python -m src.evaluation.eval --checkpoint=/path/to/best.ckpt --task_name='lift_tray' --num_rollouts=10
 
 Requirements:
     - CoppeliaSim installed and configured
-    - Trained bimanual model checkpoint
+    - Trained bimanual model checkpoint (.ckpt or .pt)
 """
 import argparse
-import pickle
 from pathlib import Path
 
 import torch
 
+from external.ip.configs.bimanual_config import get_config
 from src.models.diffusion import BimanualGraphDiffusion
 from src.evaluation.rl_bench_utils import rollout_bimanual_model
 from src.evaluation.rl_bench_tasks import BIMANUAL_TASK_NAMES
@@ -32,11 +32,9 @@ def main():
     parser.add_argument('--num_rollouts', type=int, default=5,
                         help='Number of evaluation episodes')
     
-    # Model settings
-    parser.add_argument('--model_path', type=str, default='./checkpoints',
-                        help='Path to model checkpoint directory')
-    parser.add_argument('--checkpoint', type=str, default='best.pt',
-                        help='Checkpoint file name')
+    # Model settings - now accepts direct checkpoint path
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to checkpoint file (.ckpt or .pt)')
     
     # Execution settings
     parser.add_argument('--execution_horizon', type=int, default=8,
@@ -56,37 +54,63 @@ def main():
     
     args = parser.parse_args()
     
-    # === Load config and model ===
-    model_path = Path(args.model_path)
-    config_path = model_path / 'config.pkl'
-    checkpoint_path = model_path / args.checkpoint
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found at {config_path}")
+    # === Load checkpoint ===
+    checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
     
-    print(f"Loading config from {config_path}")
-    with open(config_path, 'rb') as f:
-        config = pickle.load(f)
+    print(f"Loading checkpoint from {checkpoint_path}")
+    
+    # Try to load config from checkpoint, fall back to default config
+    try:
+        # For Lightning checkpoints, config may be in hparams
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        if 'hyper_parameters' in ckpt and 'config' in ckpt['hyper_parameters']:
+            config = ckpt['hyper_parameters']['config']
+            print("Loaded config from checkpoint hyper_parameters")
+        elif 'config' in ckpt:
+            config = ckpt['config']
+            print("Loaded config from checkpoint")
+        else:
+            print("No config in checkpoint, using default config")
+            config = get_config()
+    except Exception as e:
+        print(f"Could not extract config from checkpoint ({e}), using default config")
+        config = get_config()
+    
+    # Convert serialized lists back to tensors
+    tensor_keys = ['min_actions', 'max_actions', 'gripper_keypoints']
+    for key in tensor_keys:
+        if key in config and isinstance(config[key], list):
+            config[key] = torch.tensor(config[key], dtype=torch.float32)
     
     # Override config for evaluation
+    # IMPORTANT: num_demos affects model architecture (embedding sizes)
+    # Must match training config, so we only override if not in checkpoint
+    trained_num_demos = config.get('num_demos', 1)
+    if args.num_demos != trained_num_demos:
+        print(f"WARNING: --num_demos={args.num_demos} but model was trained with num_demos={trained_num_demos}")
+        print(f"         Using trained value ({trained_num_demos}) to match model architecture.")
+    
     config['device'] = args.device
     config['compile_models'] = bool(args.compile_models)
     config['batch_size'] = 1
-    config['num_demos'] = args.num_demos
+    # Keep num_demos from training config (affects embedding size)
+    config['num_demos'] = trained_num_demos
     config['num_diffusion_iters_test'] = config.get('num_diffusion_iters_test', 4)
+    
+    print(f"Config: num_demos={config['num_demos']}, traj_horizon={config.get('traj_horizon', 10)}, pred_horizon={config.get('pre_horizon', 8)}")
     
     print(f"Loading model from {checkpoint_path}")
     model = BimanualGraphDiffusion.load_from_checkpoint(
         str(checkpoint_path),
         config=config,
-        strict=True,
+        strict=False,  # Allow missing/extra keys
         map_location=config['device']
     ).to(config['device'])
     
     # Reinitialize graphs for evaluation batch size
-    model.model.reinit_graphs(1, num_demos=args.num_demos)
+    model.model.reinit_graphs(1, num_demos=trained_num_demos)
     model.eval()
     
     if args.compile_models:
@@ -96,7 +120,7 @@ def main():
     # === Run evaluation ===
     print(f"\n{'='*60}")
     print(f"Evaluating on task: {args.task_name}")
-    print(f"  - Num demos: {args.num_demos}")
+    print(f"  - Num demos: {trained_num_demos}")
     print(f"  - Num rollouts: {args.num_rollouts}")
     print(f"  - Execution horizon: {args.execution_horizon}")
     print(f"  - Max steps: {args.max_steps}")
@@ -106,7 +130,7 @@ def main():
     
     success_rate = rollout_bimanual_model(
         model=model,
-        num_demos=args.num_demos,
+        num_demos=trained_num_demos,
         task_name=args.task_name,
         max_execution_steps=args.max_steps,
         execution_horizon=args.execution_horizon,

@@ -45,8 +45,9 @@ def get_config():
     
     # ============== Demonstrations ==============
     
-    config['num_demos'] = 1  # Currently dataset provides 1 demo per sample
-    config['num_demos_test'] = 1
+    config['num_demos'] = 2  # Max demos during training
+    config['num_demos_test'] = 1  # Demos at eval time
+    config['randomise_num_demos'] = True  # Randomly use 1 or 2 demos during training
     config['traj_horizon'] = 10  # Waypoints per demo
     config['pre_horizon'] = 8   # Prediction horizon
     
@@ -85,10 +86,10 @@ def get_config():
         'trajectory_length': 100,
         'num_waypoints': 10,
         'pattern_weights': {
-            'symmetric_lift': 0.30,
-            'handover': 0.25,
-            'hold_and_manipulate': 0.25,
-            'independent': 0.20,
+            'symmetric_lift': 1.0,  # 100% symmetric lift for lift_tray task
+            'handover': 0.0,
+            'hold_and_manipulate': 0.0,
+            'independent': 0.0,
         },
         'perturbation_prob': 0.30,
         'grip_flip_prob': 0.10,

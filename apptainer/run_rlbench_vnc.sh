@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run RLBench evaluation with VNC GUI on MSI
+# Run RLBench evaluation with VNC GUI on MSI HPC
 # Usage: ./run_rlbench_vnc.sh [command]
 # Example: ./run_rlbench_vnc.sh python -m src.evaluation.eval --task_name=lift_tray
 
@@ -8,6 +8,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CONTAINER="$SCRIPT_DIR/rlbench.sif"
+DISPLAY_NUM="${RLBENCH_DISPLAY:-1}"
+VNC_PORT="${RLBENCH_VNC_PORT:-5900}"
 
 # Check container exists
 if [ ! -f "$CONTAINER" ]; then
@@ -17,93 +19,123 @@ if [ ! -f "$CONTAINER" ]; then
 fi
 
 # ============================================
-# MSI-specific: Library bindings for Rocky Linux -> Ubuntu container
-# Same approach as Isaac Gym setup
+# Library bindings for Rocky Linux -> Ubuntu container
 # ============================================
-
-# Find NVIDIA driver libraries on host (Rocky Linux paths)
 NVIDIA_LIB_DIR="/usr/lib64"
-if [ ! -d "$NVIDIA_LIB_DIR" ]; then
-    NVIDIA_LIB_DIR="/usr/lib/x86_64-linux-gnu"
-fi
+[ ! -d "$NVIDIA_LIB_DIR" ] && NVIDIA_LIB_DIR="/usr/lib/x86_64-linux-gnu"
 
-# Collect library bindings
 BIND_LIBS=""
-
-# Core NVIDIA libraries needed for OpenGL rendering
-NVIDIA_LIBS=(
-    "libGLX_nvidia.so"
-    "libEGL_nvidia.so"
-    "libnvidia-glcore.so"
-    "libnvidia-tls.so"
-    "libnvidia-glsi.so"
-    "libGLdispatch.so"
-    "libOpenGL.so"
-    "libGLX.so"
-    "libEGL.so"
-)
-
-for lib in "${NVIDIA_LIBS[@]}"; do
-    # Find the library (may have version suffix)
+for lib in libGLX_nvidia.so libEGL_nvidia.so libnvidia-glcore.so libnvidia-tls.so \
+           libnvidia-glsi.so libGLdispatch.so libOpenGL.so libGLX.so libEGL.so; do
     found=$(find $NVIDIA_LIB_DIR -name "${lib}*" 2>/dev/null | head -1)
-    if [ -n "$found" ]; then
-        # Bind to Ubuntu-expected path inside container
-        BIND_LIBS="$BIND_LIBS --bind $found:/usr/lib/x86_64-linux-gnu/$(basename $found)"
-    fi
+    [ -n "$found" ] && BIND_LIBS="$BIND_LIBS --bind $found:/usr/lib/x86_64-linux-gnu/$(basename $found)"
 done
 
-# Bind Vulkan ICD files if present (CoppeliaSim may use them)
-if [ -d "/usr/share/vulkan/icd.d" ]; then
-    BIND_LIBS="$BIND_LIBS --bind /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d"
-fi
+[ -d "/usr/share/vulkan/icd.d" ] && BIND_LIBS="$BIND_LIBS --bind /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d"
 
 # ============================================
 # Project bindings
 # ============================================
-
-# Bind the project directory
 PROJECT_BINDS="--bind $PROJECT_DIR:/workspace"
-
-# Bind PyRep and RLBench for installation
-PYREP_BIND="--bind $PROJECT_DIR/PyRep:/pyrep_src"
-RLBENCH_BIND="--bind $PROJECT_DIR/RLBench:/rlbench_src"
+PYREP_BIND="--bind $PROJECT_DIR/external/PyRep:/pyrep_src"
+RLBENCH_BIND="--bind $PROJECT_DIR/external/RLBench:/rlbench_src"
+SCRATCH_BIND=""
+[ -d "/scratch.global/$USER" ] && SCRATCH_BIND="--bind /scratch.global/$USER:/scratch.global/$USER"
 
 # ============================================
-# Run container
+# Cleanup stale processes
 # ============================================
+cleanup_stale_processes() {
+    if command -v ps >/dev/null 2>&1; then
+        for pattern in "Xvfb :$DISPLAY_NUM" "x11vnc.*-rfbport $VNC_PORT" "fluxbox"; do
+            pid=$(ps -u "$USER" -o pid= -o args= | awk "/$pattern/{print \$1; exit}")
+            [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        done
+    fi
+    rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"
+}
 
 echo "==================================="
 echo "Starting RLBench container with VNC"
 echo "Project: $PROJECT_DIR"
 echo "==================================="
 
-# If no command specified, just start shell
-if [ $# -eq 0 ]; then
-    CMD="bash"
-else
-    CMD="$@"
-fi
+cleanup_stale_processes
 
-# Run with GPU and all bindings
-apptainer run --nv \
+# Default command
+CMD="${@:-bash}"
+
+# Run container
+apptainer exec --nv \
     $BIND_LIBS \
     $PROJECT_BINDS \
     $PYREP_BIND \
     $RLBENCH_BIND \
+    $SCRATCH_BIND \
     --pwd /workspace \
     $CONTAINER \
     bash -c "
-        # Install PyRep and RLBench on first run
-        if [ ! -f /tmp/.pyrep_installed ]; then
-            echo 'Installing PyRep...'
-            cd /pyrep_src && pip install -r requirements.txt && pip install . && touch /tmp/.pyrep_installed
+        # Start Xvfb + VNC
+        export DISPLAY=:$DISPLAY_NUM
+        Xvfb :$DISPLAY_NUM -screen 0 1280x1024x24 &
+        sleep 2
+        x11vnc -display :$DISPLAY_NUM -forever -nopw -rfbport $VNC_PORT -noxdamage -nowf &
+        sleep 1
+        fluxbox &
+        sleep 1
+
+        echo '==================================='
+        echo 'VNC server running on port $VNC_PORT'
+        echo 'Connect via: ssh -L $VNC_PORT:<node>:$VNC_PORT user@agate.msi.umn.edu'
+        echo 'Then open VNC viewer to localhost:$VNC_PORT'
+        echo '==================================='
+
+        # Environment setup
+        export PYTHONPATH=/workspace/external:\$PYTHONPATH
+        
+        # CoppeliaSim setup (copy to writable path)
+        if [ ! -d /workspace/.coppeliasim ]; then
+            echo 'Copying CoppeliaSim to /workspace/.coppeliasim...'
+            cp -r /opt/CoppeliaSim /workspace/.coppeliasim
         fi
-        if [ ! -f /tmp/.rlbench_installed ]; then
-            echo 'Installing RLBench...'
-            cd /rlbench_src && pip install -r requirements.txt && pip install . && touch /tmp/.rlbench_installed
+        export COPPELIASIM_ROOT=/workspace/.coppeliasim
+        export LD_LIBRARY_PATH=\$COPPELIASIM_ROOT:\$LD_LIBRARY_PATH
+        export QT_QPA_PLATFORM_PLUGIN_PATH=\$COPPELIASIM_ROOT
+
+        # Persistent install markers (not /tmp which doesn't persist across nodes)
+        mkdir -p /workspace/.installed
+
+        # Install PyRep (PerAct2 bimanual fork)
+        if [ ! -f /workspace/.installed/.pyrep_ok ]; then
+            pip uninstall -y pyrep rlbench 2>/dev/null || true
+            pip install --no-cache-dir 'cffi>=1.14.0' setuptools wheel numpy
+            
+            echo 'Installing PyRep from /pyrep_src...'
+            cd /pyrep_src
+            [ -z \"\$COPPELIASIM_ROOT\" ] || [ ! -d \"\$COPPELIASIM_ROOT\" ] && { echo 'ERROR: COPPELIASIM_ROOT invalid!'; exit 1; }
+            pip install --no-cache-dir -r requirements.txt
+            pip install --no-cache-dir --no-build-isolation --force-reinstall . || {
+                python setup.py build_ext --inplace && pip install --no-cache-dir --no-deps .
+            }
+            touch /workspace/.installed/.pyrep_ok
         fi
         
-        # Install bimanual project
+        # Install RLBench (PerAct2 bimanual fork)
+        if [ ! -f /workspace/.installed/.rlbench_ok ]; then
+            echo 'Installing RLBench from /rlbench_src...'
+            cd /rlbench_src
+            pip install --no-cache-dir -r requirements.txt
+            pip install --no-cache-dir --force-reinstall .
+            touch /workspace/.installed/.rlbench_ok
+        fi
+        
+        # Verify bimanual support
+        python -c 'from pyrep.robots.arms.dual_panda import PandaLeft; print(\"PyRep bimanual support: OK\")' || {
+            echo 'ERROR: PyRep missing bimanual support! Check external/PyRep is PerAct2 fork.'
+            exit 1
+        }
+        
+        # Install project
         cd /workspace && pip install -e . 2>/dev/null || true
         
         # Run user command

@@ -22,11 +22,13 @@ export APPTAINER_TMPDIR=$HOME/apptainer_tmp
 mkdir -p $APPTAINER_CACHEDIR $APPTAINER_TMPDIR
 
 # Load CUDA and build
-module load cuda/11.8.0
+module load cuda/12.1.1
 cd apptainer/
 chmod +x build_container.sh
 ./build_container.sh
 ```
+
+Note: `run_rlbench_vnc.sh` binds `external/PyRep` and `external/RLBench` into the container.
 
 ### Step 2: Run Evaluation
 
@@ -59,7 +61,7 @@ Open VNC viewer → connect to `localhost:5900`
 | CoppeliaSim | 4.1.0           | Robot simulation                |
 | PyRep       | latest          | Python interface to CoppeliaSim |
 | RLBench     | PerAct2 fork    | Bimanual task benchmark         |
-| PyTorch     | 2.1 + CUDA 11.8 | Model inference                 |
+| PyTorch     | 2.2 + CUDA 12.1 | Model inference                 |
 | PyG         | latest          | Graph neural networks           |
 
 ## Troubleshooting

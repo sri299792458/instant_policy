@@ -8,8 +8,8 @@
 #SBATCH --partition=msigpu
 #SBATCH --gres=gpu:a100:1
 #SBATCH --account=kdesingh
-#SBATCH -o logs/bimanual_ip_full-%j.out
-#SBATCH -e logs/bimanual_ip_full-%j.err
+#SBATCH -o /users/7/kanth042/bimanual_instant_policy/logs/bimanual_ip_full-%j.out
+#SBATCH -e /users/7/kanth042/bimanual_instant_policy/logs/bimanual_ip_full-%j.err
 
 set -euo pipefail
 
@@ -36,8 +36,11 @@ echo "--------------------"
 # Change to repo directory
 cd ~/bimanual_instant_policy
 
+# Add external to PYTHONPATH so 'ip' module is importable
+export PYTHONPATH="${PYTHONPATH:-}:${HOME}/bimanual_instant_policy/external"
+
 # Training configuration
-RUN_NAME="bimanual_ip_full"
+RUN_NAME="symmetric_lift_v1"
 SAVE_ROOT="/scratch.global/kanth042/ip/checkpoints"
 WANDB_DIR="/scratch.global/kanth042/ip/wandb"
 
@@ -47,7 +50,7 @@ python -u -m scripts.train \
   --online_pseudo_demos 1 \
   --batch_size 16 \
   --lr 3e-5 \
-  --max_steps 2000000 \
+  --max_steps 300000 \
   --num_workers 8 \
   --record 1 \
   --use_wandb 1 \

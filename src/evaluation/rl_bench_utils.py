@@ -29,7 +29,7 @@ from src.data.data_structures import BimanualGraphData
 
 def get_bimanual_point_cloud(
     obs,
-    camera_names: Tuple[str, ...] = ('front', 'left_shoulder', 'right_shoulder'),
+    camera_names: Tuple[str, ...] = ('front', 'overhead', 'over_shoulder_left', 'over_shoulder_right', 'wrist_left', 'wrist_right'),
     mask_threshold: int = 60
 ) -> np.ndarray:
     """
@@ -44,12 +44,19 @@ def get_bimanual_point_cloud(
         Merged and downsampled point cloud [N, 3]
     """
     pcds = []
+    
+    # DEBUG: Print available camera keys on first call
+    if hasattr(obs, 'perception_data') and obs.perception_data:
+        available_keys = list(obs.perception_data.keys())
+        print(f"DEBUG: Available perception_data keys: {available_keys[:20]}...")  # First 20
+    
     for camera_name in camera_names:
         # Get point cloud and mask from perception data
         pcd_key = f'{camera_name}_point_cloud'
         mask_key = f'{camera_name}_mask'
         
         if pcd_key not in obs.perception_data or obs.perception_data[pcd_key] is None:
+            print(f"DEBUG: Camera '{camera_name}' not found (key: {pcd_key})")
             continue
             
         pcd = obs.perception_data[pcd_key]
@@ -77,12 +84,14 @@ def get_bimanual_point_cloud(
     
     if len(pcds) == 0:
         # Return minimal point cloud if nothing passed filtering
+        print("WARNING: No point clouds extracted!")
         return np.zeros((100, 3))
     
     merged_pcd = np.concatenate(pcds, axis=0)
     
     # Guard against empty result after merging
     if len(merged_pcd) < 10:
+        print(f"WARNING: Only {len(merged_pcd)} points after merging!")
         return np.zeros((100, 3))
     
     return downsample_pcd(merged_pcd)
@@ -367,22 +376,15 @@ def rollout_bimanual_model(
         Success rate [0, 1]
     """
     # === Setup environment ===
-    # FIX #6: Don't use set_all() - bundled RLBench has bug in set_all_high_dim
-    obs_config = ObservationConfig(
-        camera_configs={
-            'front': CameraConfig(rgb=True, depth=True, point_cloud=True, mask=True),
-            'left_shoulder': CameraConfig(rgb=True, depth=True, point_cloud=True, mask=True),
-            'right_shoulder': CameraConfig(rgb=True, depth=True, point_cloud=True, mask=True),
-        },
-        joint_velocities=True,
-        joint_positions=True,
-        joint_forces=True,
-        gripper_open=True,
-        gripper_pose=True,
-        gripper_matrix=True,  # Need 4x4 transform
-        gripper_joint_positions=True,
-        task_low_dim_state=True,
-    )
+    # Bimanual camera names differ from single-arm (found in dataset_generator_bimanual.py)
+    BIMANUAL_CAMERA_NAMES = ["over_shoulder_left", "over_shoulder_right", "overhead", "wrist_right", "wrist_left", "front"]
+    
+    obs_config = ObservationConfig()
+    obs_config.set_all(True)
+    # Must explicitly set camera_configs for bimanual scenes
+    camera_configs = {cam: CameraConfig(rgb=True, depth=True, point_cloud=True, mask=True) 
+                      for cam in BIMANUAL_CAMERA_NAMES}
+    obs_config.camera_configs = camera_configs
     
     action_mode = BimanualMoveArmThenGripper(
         arm_action_mode=BimanualEndEffectorPoseViaPlanning(),
@@ -476,6 +478,30 @@ def rollout_bimanual_model(
             )
             data = data.to(config['device'])
             
+            # DEBUG: Print demo and current state info (only on first step)
+            if k == 0:
+                print("\n" + "="*60)
+                print("DEBUG: Demo and Current State Info")
+                print("="*60)
+                print(f"Num demos: {len(processed_demos)}")
+                for di, demo in enumerate(processed_demos):
+                    print(f"\nDemo {di}:")
+                    print(f"  Num waypoints: {len(demo['T_w_left'])}")
+                    print(f"  Left poses[0] pos: {demo['T_w_left'][0][:3, 3]}")
+                    print(f"  Right poses[0] pos: {demo['T_w_right'][0][:3, 3]}")
+                    print(f"  Left grips: {demo['grips_left']}")
+                    print(f"  Right grips: {demo['grips_right']}")
+                print(f"\nCurrent observation:")
+                print(f"  Left EE pos: {T_w_left[:3, 3]}")
+                print(f"  Right EE pos: {T_w_right[:3, 3]}")
+                print(f"  Left grip open: {grip_left}")
+                print(f"  Right grip open: {grip_right}")
+                print(f"\nData tensors:")
+                print(f"  demo_T_w_left shape: {data.demo_T_w_left.shape}")
+                print(f"  pos_demos_left shape: {data.pos_demos_left.shape}")
+                print(f"  pos_obs_left shape: {data.pos_obs_left.shape}")
+                print("="*60 + "\n")
+            
             # Cache demo scene embeddings (once per rollout)
             if not demo_embds_cached:
                 for arm in ['left', 'right']:
@@ -518,6 +544,13 @@ def rollout_bimanual_model(
                 if grips_right.ndim > 1:
                     grips_right = grips_right.squeeze(-1)
             
+            # DEBUG: Print action predictions
+            print(f"\n[Step {k}] Model predictions:")
+            print(f"  Left action[0] translation: {actions_left[0, :3, 3]}")
+            print(f"  Right action[0] translation: {actions_right[0, :3, 3]}")
+            print(f"  Left grips: {grips_left}")
+            print(f"  Right grips: {grips_right}")
+            
             # FIX #1: Store initial poses - all actions are relative to THIS pose
             T_w_left_initial = T_w_left.copy()
             T_w_right_initial = T_w_right.copy()
@@ -549,11 +582,14 @@ def rollout_bimanual_model(
                 env_action[16] = grip_left_action
                 env_action[17] = 1  # ignore collisions
                 
+                # DEBUG: Print action being executed
+                print(f"  Exec {k}.{j}: L_pos={pose_left[:3]}, R_pos={pose_right[:3]}, "
+                      f"L_grip={grip_left_action}, R_grip={grip_right_action}")
+                
                 try:
                     curr_obs, reward, terminate = task.step(env_action)
                     success = int(terminate and reward > 0.)
-                    # FIX #1: Don't update T_w_left/right here - actions[j] are all
-                    # relative to T_w_left_initial/T_w_right_initial, not incremental
+                    print(f"           reward={reward:.3f}, terminate={terminate}, success={success}")
                         
                 except Exception as e:
                     print(f"Step failed: {e}")

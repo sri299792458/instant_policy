@@ -174,8 +174,8 @@ class BimanualAGI(nn.Module):
             norm='layer'
         ).to(config['device'])
         
-        # Compile encoders
-        if config.get('compile_model', True):
+        # Compile encoders only if explicitly requested (defaults to False for faster debugging)
+        if config.get('compile_model', False):
             self.local_encoder = torch.compile(self.local_encoder, mode="reduce-overhead")
             self.cond_encoder = torch.compile(self.cond_encoder, mode="reduce-overhead")
             self.action_encoder = torch.compile(self.action_encoder, mode="reduce-overhead")
@@ -351,10 +351,19 @@ class BimanualAGI(nn.Module):
                 setattr(data, f'live_scene_embds_{arm}', embds)
                 setattr(data, f'live_scene_pos_{arm}', pos)
             
-            if not hasattr(data, f'action_scene_embds_{arm}'):
-                embds, pos = self.get_action_scene_emb(data, arm)
-                setattr(data, f'action_scene_embds_{arm}', embds)
-                setattr(data, f'action_scene_pos_{arm}', pos)
+            # CRITICAL FIX: Action scene embeddings should match reference impl:
+            # Replicate live scene embeddings for all prediction timesteps
+            # (Previously was calling get_action_scene_emb with caching which
+            # caused stale embeddings across diffusion iterations)
+            live_embds = getattr(data, f'live_scene_embds_{arm}')  # [B, S, D]
+            live_pos = getattr(data, f'live_scene_pos_{arm}')  # [B, S, 3]
+            
+            # Replicate for pred_horizon timesteps [B, P, S, D]
+            action_embds = live_embds[:, None, :, :].repeat(1, self.pred_horizon, 1, 1)
+            action_pos = live_pos[:, None, :, :].repeat(1, self.pred_horizon, 1, 1)
+            
+            setattr(data, f'action_scene_embds_{arm}', action_embds)
+            setattr(data, f'action_scene_pos_{arm}', action_pos)
         
         # ============== Graph Update ==============
         self.graph.update_graph(data)

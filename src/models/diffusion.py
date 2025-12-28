@@ -34,6 +34,17 @@ class BimanualGraphDiffusion(L.LightningModule):
     
     def __init__(self, config):
         super().__init__()
+        
+        # Save config to checkpoint for loading during inference
+        # Convert tensors to lists for serialization
+        config_serializable = {}
+        for k, v in config.items():
+            if isinstance(v, torch.Tensor):
+                config_serializable[k] = v.tolist()
+            else:
+                config_serializable[k] = v
+        self.save_hyperparameters({'config': config_serializable})
+        
         self.model = BimanualAGI(config)
         
         # Store references for parameter counting
