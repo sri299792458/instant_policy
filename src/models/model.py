@@ -293,13 +293,14 @@ class BimanualAGI(nn.Module):
         
         actions_flat = actions.view(-1, 4, 4)  # [B*P, 4, 4]
         
-        # Transform to match original IP: R^T @ p, then - t
-        # This expresses current observation in the future action frame
-        current_obs = torch.bmm(
-            actions_flat[:, :3, :3].transpose(1, 2),
-            current_obs.permute(0, 2, 1)
-        ).permute(0, 2, 1)
-        current_obs = current_obs - actions_flat[:, :3, 3][:, None, :]
+        # Transform point cloud to action frame using correct SE(3) inverse.
+        # Action T_rel = T_current^{-1} @ T_future has t_rel in CURRENT frame.
+        # Correct inverse: p_action = R^T @ (p_current - t_rel)
+        # We must subtract FIRST, then rotate.
+        t_rel = actions_flat[:, :3, 3][:, None, :]  # [B*P, 1, 3] in current frame
+        current_obs = current_obs - t_rel  # Translate to action origin
+        R_T = actions_flat[:, :3, :3].transpose(1, 2)  # R^T
+        current_obs = torch.bmm(R_T, current_obs.permute(0, 2, 1)).permute(0, 2, 1)  # Rotate to action axes
         
         # Encode
         action_batch = torch.arange(
