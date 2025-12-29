@@ -188,11 +188,6 @@ class BimanualGraphDiffusion(L.LightningModule):
         labels_left[..., :6] = self.normalizer_left.normalize_labels(labels_left[..., :6])
         labels_right[..., :6] = self.normalizer_right.normalize_labels(labels_right[..., :6])
         
-        # CRITICAL: Save ground truth before overwriting!
-        # Coordination loss needs GT, not noisy actions
-        gt_actions_left = data.actions_left.clone()
-        gt_actions_right = data.actions_right.clone()
-        
         # Store noisy actions in data
         data.actions_left = noisy_actions_left
         data.actions_right = noisy_actions_right
@@ -207,26 +202,6 @@ class BimanualGraphDiffusion(L.LightningModule):
         loss_left = self.loss_fn(preds_left, labels_left)
         loss_right = self.loss_fn(preds_right, labels_right)
         loss = (loss_left + loss_right) / 2
-        
-        # Optional coordination consistency loss
-        # CRITICAL: Must compute on MODEL PREDICTIONS, not noisy inputs!
-        if self.config.get('use_coordination_loss', False):
-            # Decode predictions from delta format to SE(3) actions
-            pred_actions_left = self._decode_predictions_to_actions(
-                preds_left, noisy_actions_left, 'left'
-            )
-            pred_actions_right = self._decode_predictions_to_actions(
-                preds_right, noisy_actions_right, 'right'
-            )
-            
-            # Now compute coordination loss on predictions vs ground truth
-            coord_loss = self._compute_coordination_loss(
-                pred_actions_left, pred_actions_right,
-                gt_actions_left, gt_actions_right
-            )
-            coord_weight = self.config.get('coordination_loss_weight', 0.1)
-            loss = loss + coord_weight * coord_loss
-            self.log("Train_Coord_Loss", coord_loss, on_step=True, on_epoch=True)
         
         self.log("Train_Loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("Train_Loss_Left", loss_left, on_step=True, on_epoch=True)
@@ -398,45 +373,6 @@ class BimanualGraphDiffusion(L.LightningModule):
         ).view(batch_size, -1, 4, 4)
         
         return noisy_actions, noisy_grips
-    
-    def _compute_coordination_loss(self, noisy_left: torch.Tensor, noisy_right: torch.Tensor,
-                                    gt_left: torch.Tensor, gt_right: torch.Tensor) -> torch.Tensor:
-        """
-        Compute coordination consistency loss to maintain relative poses.
-        
-        Penalizes large changes in the relative transformation between arms,
-        encouraging coordinated movement during symmetric/cooperative tasks.
-        
-        Args:
-            noisy_left: [B, P, 4, 4] noisy left actions
-            noisy_right: [B, P, 4, 4] noisy right actions
-            gt_left: [B, P, 4, 4] ground truth left actions
-            gt_right: [B, P, 4, 4] ground truth right actions
-        
-        Returns:
-            Scalar coordination loss
-        """
-        B, P = noisy_left.shape[:2]
-        
-        # Compute relative transforms: T_left_to_right = T_left^-1 @ T_right
-        # For noisy actions
-        T_left_inv_noisy = torch.inverse(noisy_left.reshape(-1, 4, 4))
-        T_right_noisy = noisy_right.reshape(-1, 4, 4)
-        T_rel_noisy = torch.bmm(T_left_inv_noisy, T_right_noisy).reshape(B, P, 4, 4)
-        
-        # For ground truth actions
-        T_left_inv_gt = torch.inverse(gt_left.reshape(-1, 4, 4))
-        T_right_gt = gt_right.reshape(-1, 4, 4)
-        T_rel_gt = torch.bmm(T_left_inv_gt, T_right_gt).reshape(B, P, 4, 4)
-        
-        # Loss on relative translation
-        trans_loss = torch.norm(T_rel_noisy[..., :3, 3] - T_rel_gt[..., :3, 3], dim=-1).mean()
-        
-        # Loss on relative rotation (Frobenius norm of rotation matrix difference)
-        rot_diff = T_rel_noisy[..., :3, :3] - T_rel_gt[..., :3, :3]
-        rot_loss = torch.norm(rot_diff.reshape(B, P, 9), dim=-1).mean()
-        
-        return trans_loss + rot_loss
     
     def _decode_predictions_to_actions(self, preds: torch.Tensor, 
                                        noisy_actions: torch.Tensor,

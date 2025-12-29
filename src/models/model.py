@@ -174,13 +174,8 @@ class BimanualAGI(nn.Module):
             norm='layer'
         ).to(config['device'])
         
-        # Note: torch.compile is called via compile_models() below
         
-        # ============== Coordination Gating (Disabled) ==============
-        # Removed: The transformer's relation-aware attention naturally learns
-        # when to use cross-arm edges. With sparse same-timestep cross edges,
-        # a scalar gate is redundant and risks collapse to 0.
-        self.use_coordination_gate = False
+        # Note: torch.compile is called via compile_models() below
         
         # ============== Prediction Heads (per arm) ==============
         # Left arm
