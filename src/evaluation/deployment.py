@@ -141,14 +141,14 @@ class BimanualPolicy:
                 np.stack(T_demos_right, axis=0),
                 dtype=torch.float32, device=self.device
             ),
-            'grips_demos_left': torch.tensor(
+            'grips_demos_left': (torch.tensor(
                 np.stack(grips_demos_left, axis=0),
                 dtype=torch.float32, device=self.device
-            ),
-            'grips_demos_right': torch.tensor(
+            ) - 0.5) * 2,
+            'grips_demos_right': (torch.tensor(
                 np.stack(grips_demos_right, axis=0),
                 dtype=torch.float32, device=self.device
-            ),
+            ) - 0.5) * 2,
             'pos_demos_left': torch.tensor(
                 np.stack(pos_demos_left, axis=0),
                 dtype=torch.float32, device=self.device
@@ -221,8 +221,9 @@ class BimanualPolicy:
         # Add observation data
         data.T_obs_left = torch.tensor(T_w_left, dtype=torch.float32, device=self.device).unsqueeze(0)
         data.T_obs_right = torch.tensor(T_w_right, dtype=torch.float32, device=self.device).unsqueeze(0)
-        data.current_grip_left = torch.tensor([grip_left], dtype=torch.float32, device=self.device)
-        data.current_grip_right = torch.tensor([grip_right], dtype=torch.float32, device=self.device)
+        # Normalize current grips from [0,1] to [-1,+1] to match training
+        data.current_grip_left = torch.tensor([(grip_left - 0.5) * 2], dtype=torch.float32, device=self.device)
+        data.current_grip_right = torch.tensor([(grip_right - 0.5) * 2], dtype=torch.float32, device=self.device)
         
         # Observation point clouds - flatten [N, 3]
         data.pos_obs_left = torch.tensor(pcd_left, dtype=torch.float32, device=self.device)

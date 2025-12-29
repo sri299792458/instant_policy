@@ -263,15 +263,17 @@ def prepare_bimanual_data(
         np.array([[demo['T_w_right'] for demo in demos]]),
         dtype=torch.float32
     )
-    # FIX #3: Keep grips as raw 0/1 values - normalization happens in model
-    demo_grips_left = torch.tensor(
+    # Normalize grips from [0,1] to [-1,+1] to match training
+    demo_grips_left = (torch.tensor(
         np.array([[g for g in demo['grips_left']] for demo in demos]),
         dtype=torch.float32
-    ).unsqueeze(0)  # [1, num_demos, traj_horizon]
-    demo_grips_right = torch.tensor(
+    ) - 0.5) * 2
+    demo_grips_left = demo_grips_left.unsqueeze(0)  # [1, num_demos, traj_horizon]
+    demo_grips_right = (torch.tensor(
         np.array([[g for g in demo['grips_right']] for demo in demos]),
         dtype=torch.float32
-    ).unsqueeze(0)
+    ) - 0.5) * 2
+    demo_grips_right = demo_grips_right.unsqueeze(0)
     
     # FIX #2: Compute cross-arm transforms for demos
     demo_T_left_to_right = []
@@ -331,10 +333,9 @@ def prepare_bimanual_data(
         pos_obs_left=pos_obs_left,
         pos_obs_right=pos_obs_right,
         batch_pos_obs=batch_pos_obs,
-        # FIX #3 & #4: Keep raw values, use shape [1] for batch dimension
-        # BimanualGraphRep.update_graph expects [B] shape, not scalar
-        current_grip_left=torch.tensor([grip_left], dtype=torch.float32),
-        current_grip_right=torch.tensor([grip_right], dtype=torch.float32),
+        # Normalize current grips from [0,1] to [-1,+1] to match training
+        current_grip_left=torch.tensor([(grip_left - 0.5) * 2], dtype=torch.float32),
+        current_grip_right=torch.tensor([(grip_right - 0.5) * 2], dtype=torch.float32),
         current_T_left_to_right=torch.tensor(current_T_left_to_right, dtype=torch.float32),  # FIX #2
         
         # Actions (to be denoised)
