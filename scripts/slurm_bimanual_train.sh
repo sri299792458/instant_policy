@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=bimanual_ip_full
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -40,7 +40,7 @@ cd ~/bimanual_instant_policy
 export PYTHONPATH="${PYTHONPATH:-}:${HOME}/bimanual_instant_policy/external"
 
 # Training configuration
-RUN_NAME="symmetric_lift_v1"
+RUN_NAME="symmetric_lift_v2"
 SAVE_ROOT="/scratch.global/kanth042/ip/checkpoints"
 WANDB_DIR="/scratch.global/kanth042/ip/wandb"
 

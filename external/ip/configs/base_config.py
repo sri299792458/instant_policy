@@ -8,7 +8,7 @@ config = {
     'pre_trained_encoder': True,
     'freeze_encoder': True,
     'save_every': 100000,
-    'compile_models': False,
+    'compile_models': True,
     # Model config
     'local_num_freq': 10,
     'local_nn_dim': 512,

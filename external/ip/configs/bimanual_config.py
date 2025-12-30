@@ -48,8 +48,8 @@ def get_config():
     config['num_demos'] = 2  # Max demos during training
     config['num_demos_test'] = 1  # Demos at eval time
     config['randomise_num_demos'] = True  # Randomly use 1 or 2 demos during training
-    config['traj_horizon'] = 10  # Waypoints per demo
-    config['pre_horizon'] = 8   # Prediction horizon
+    config['traj_horizon'] = 6  # Waypoints per demo (reduced from 10)
+    config['pre_horizon'] = 4   # Prediction horizon (reduced from 8)
     
     # ============== Training ==============
     
@@ -82,7 +82,7 @@ def get_config():
         'min_objects': 1,
         'max_objects': 5,
         'num_points_per_object': 512,
-        'total_scene_points': 2048,
+        'total_scene_points': 1024,
         'trajectory_length': 100,
         'num_waypoints': 10,
         'pattern_weights': {
