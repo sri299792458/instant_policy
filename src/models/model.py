@@ -208,7 +208,7 @@ class BimanualAGI(nn.Module):
         
         # Compile models for faster training (enabled by default)
         # Set compile_models=False in config for debugging
-        if config.get('compile_models', True):
+        if config.get('compile_models', False):
             self.compile_models()
     
     def reinit_graphs(self, batch_size: int, num_demos: Optional[int] = None):

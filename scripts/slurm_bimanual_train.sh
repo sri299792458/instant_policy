@@ -48,7 +48,7 @@ python -u -m scripts.train \
   --run_name "${RUN_NAME}" \
   --use_pseudo_demos 1 \
   --online_pseudo_demos 1 \
-  --batch_size 16 \
+  --batch_size 32 \
   --lr 3e-5 \
   --max_steps 300000 \
   --num_workers 8 \

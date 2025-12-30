@@ -84,7 +84,7 @@ def get_config():
         'num_points_per_object': 512,
         'total_scene_points': 1024,
         'trajectory_length': 100,
-        'num_waypoints': 10,
+        'num_waypoints': 6,  # Must match traj_horizon!
         'pattern_weights': {
             'symmetric_lift': 1.0,  # 100% symmetric lift for lift_tray task
             'handover': 0.0,
